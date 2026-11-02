@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   registerRouterProvider,
   extractUncountedMessageCost,
@@ -6,6 +9,7 @@ import {
   type RouterProviderState,
   type RouterProviderActions,
 } from './provider';
+import { createCooldownStore, type CooldownStore } from './cooldown';
 import type { Api, AssistantMessage, Model } from '@earendil-works/pi-ai';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import type {
@@ -149,6 +153,8 @@ describe('provider.ts (virtual models)', () => {
       thinkingByProfile: {},
       pinnedTierByProfile: {},
       accumulatedCost: 0,
+      processStartTime: 0,
+      processedTranscriptFailures: new Set<string>(),
     };
 
     mockActions = {
@@ -948,6 +954,612 @@ describe('provider.ts (virtual models)', () => {
       expect(turn3.model.id).toBe('gpt-4o');
       expect(mockState.pinnedTierByProfile.balanced).toBeUndefined();
       expect(classifySpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('cooldowns (integration)', () => {
+    let cooldownDir: string;
+
+    beforeEach(() => {
+      cooldownDir = mkdtempSync(join(tmpdir(), 'pmr-provider-cooldown-'));
+      Object.assign(mockState, {
+        cooldownStore: createCooldownStore(
+          join(cooldownDir, 'cooldowns'),
+          () => Date.now(),
+          join(cooldownDir, 'provider-switch.json'),
+        ),
+      });
+    });
+
+    afterEach(() => {
+      rmSync(cooldownDir, { recursive: true, force: true });
+    });
+
+    it('records a cooldown on a retryable failure and skips the model on the very next route call', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const initialRoute = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(initialRoute.model.id).toBe('gpt-4o-mini');
+
+      const retry = await vm.route(
+        buildRequest({
+          reason: 'retry',
+          state: initialRoute.state,
+          failed: {
+            model: createTestModel({ provider: 'openai', id: 'gpt-4o-mini' }),
+            thinkingLevel: 'medium',
+            message: {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: '429 Too Many Requests',
+            },
+          },
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(retry.model.id).toBe('gemini-1.5-flash');
+
+      // A brand-new conversation (no carried-over state) must also skip the
+      // cooling-down primary model, proving the cooldown is shared across sessions.
+      const freshTurn = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(freshTurn.model.id).toBe('gemini-1.5-flash');
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeDefined();
+    });
+
+    it('records a non-retryable transcript error and skips the model on the next route call', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const route = await vm.route(
+        buildRequest({
+          reason: 'user',
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: 'insufficient_quota',
+            },
+            {
+              role: 'user',
+              content: 'please continue',
+              timestamp: Date.now(),
+            },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gemini-1.5-flash');
+      const entry =
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'];
+      expect(entry?.source).toBe('transcript');
+    });
+
+    it('keeps the soonest-to-expire model when every candidate for the tier is cooling down', async () => {
+      const now = Date.now();
+      mockState.cooldownStore!.record(
+        'openai/gpt-4o-mini',
+        'retry in 10 min',
+        'retry',
+        mockState.currentConfig,
+        now,
+      );
+      mockState.cooldownStore!.record(
+        'google/gemini-1.5-flash',
+        'retry in 60 min',
+        'retry',
+        mockState.currentConfig,
+        now,
+      );
+
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      const route = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(route.model.id).toBe('gpt-4o-mini');
+    });
+
+    it('review finding 2: never re-arms a transcript-observed cooldown that was already cleared, even on a later turn', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      const errorTimestamp = Date.now();
+      const transcriptWithError: ModelRouteRequest<VirtualRouterState>['messages'] =
+        [
+          { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+          {
+            ...createAssistantMsg('', 0),
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            stopReason: 'error',
+            errorMessage: 'insufficient_quota',
+            timestamp: errorTimestamp,
+          },
+          { role: 'user', content: 'please continue', timestamp: Date.now() },
+        ];
+
+      const first = await vm.route(
+        buildRequest({ reason: 'user', messages: transcriptWithError }),
+        mockState.lastExtensionContext!,
+      );
+      expect(first.model.id).toBe('gemini-1.5-flash');
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeDefined();
+
+      // An operator (or the model succeeding elsewhere) clears the cooldown to
+      // force an immediate retry of the primary model. A brand-new conversation
+      // (no carried-over sticky decision) proves the clear took effect rather
+      // than riding leftover fallback stickiness from the first call.
+      mockState.cooldownStore!.clear('openai/gpt-4o-mini');
+      mockState.lastDecision = undefined;
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeUndefined();
+
+      // The SAME historical error message is still in the transcript on the next
+      // turn. Re-scanning it must not re-arm the cooldown the clear just lifted.
+      const second = await vm.route(
+        buildRequest({ reason: 'user', messages: transcriptWithError }),
+        mockState.lastExtensionContext!,
+      );
+      expect(second.model.id).toBe('gpt-4o-mini');
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeUndefined();
+    });
+
+    it('review finding 7: keeps a cooling but usable model over an unusable (unresolvable) one, instead of throwing with zero usable candidates', async () => {
+      mockState.currentConfig.profiles.balanced.medium!.fallbacks = [
+        { model: 'google/gemini-1.5-flash' },
+        // Not recognized by the mock registry's find() — simulates an
+        // unresolvable/unauthenticated candidate.
+        { model: 'untrusted/blocked' },
+      ];
+      const now = Date.now();
+      // Every USABLE candidate is cooling; only the unusable one is not cooling.
+      mockState.cooldownStore!.record(
+        'openai/gpt-4o-mini',
+        'retry in 5 min',
+        'retry',
+        mockState.currentConfig,
+        now,
+      );
+      mockState.cooldownStore!.record(
+        'google/gemini-1.5-flash',
+        'retry in 10 min',
+        'retry',
+        mockState.currentConfig,
+        now,
+      );
+
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      // Pre-fix behavior would have filtered to only 'untrusted/blocked' (the
+      // sole non-cooling candidate) and thrown "Failed to resolve any model",
+      // breaking the turn. The fix keeps the soonest-expiring USABLE candidate.
+      const route = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(route.model.id).toBe('gpt-4o-mini');
+    });
+
+    it('never records a transcript error timestamped before this process started', async () => {
+      const historicalTimestamp = Date.now() - 60 * 60 * 1000;
+      Object.assign(mockState, { processStartTime: Date.now() });
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const route = await vm.route(
+        buildRequest({
+          reason: 'user',
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: 'insufficient_quota',
+              timestamp: historicalTimestamp,
+            },
+            {
+              role: 'user',
+              content: 'please continue',
+              timestamp: Date.now(),
+            },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      // The failure predates this process; it must be ignored, not re-recorded.
+      expect(route.model.id).toBe('gpt-4o-mini');
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeUndefined();
+    });
+
+    it('review 3 finding 2: an older success already in the transcript never erases a cooldown recorded from a newer failure', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const successTimestamp = Date.now() - 2000;
+      const errorTimestamp = Date.now() - 1000;
+      const route = await vm.route(
+        buildRequest({
+          reason: 'user',
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'stop',
+              timestamp: successTimestamp,
+            },
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: 'insufficient_quota',
+              timestamp: errorTimestamp,
+            },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      // The success predates the failure's recorded_at (both predate this
+      // real route() call); it must not clear what the error just armed.
+      expect(route.model.id).toBe('gemini-1.5-flash');
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeDefined();
+    });
+
+    it('review 3 finding 2: a success newer than the recorded failure clears the cooldown', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const errorTimestamp = Date.now();
+      const firstTranscript: ModelRouteRequest<VirtualRouterState>['messages'] =
+        [
+          { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+          {
+            ...createAssistantMsg('', 0),
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            stopReason: 'error',
+            errorMessage: 'insufficient_quota',
+            timestamp: errorTimestamp,
+          },
+        ];
+
+      await vm.route(
+        buildRequest({ reason: 'user', messages: firstTranscript }),
+        mockState.lastExtensionContext!,
+      );
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeDefined();
+
+      // A later success for the same model, timestamped strictly after the
+      // failure's recorded_at (set during the call above), must clear it.
+      const successTimestamp = Date.now() + 1000;
+      mockState.lastDecision = undefined;
+      await vm.route(
+        buildRequest({
+          reason: 'user',
+          messages: [
+            ...firstTranscript,
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'stop',
+              timestamp: successTimestamp,
+            },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeUndefined();
+    });
+
+    it('review 4 finding 2: a single scan seeing [failure t1, success t2] (t1 < t2 < scan) is NOT left cooling', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const failureTimestamp = Date.now() - 2000;
+      const successTimestamp = Date.now() - 1000;
+      const route = await vm.route(
+        buildRequest({
+          reason: 'user',
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: 'insufficient_quota',
+              timestamp: failureTimestamp,
+            },
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'stop',
+              timestamp: successTimestamp,
+            },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      // recorded_at must come from the failure's OWN timestamp (t1), not the
+      // scan time: the success (t2), though both predate this scan, is still
+      // newer than t1 and must clear the cooldown the failure just armed.
+      expect(route.model.id).toBe('gpt-4o-mini');
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeUndefined();
+    });
+
+    it('review 4 finding 2: a single scan seeing [success t1, failure t2] (t1 < t2 < scan) leaves the model cooling', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const successTimestamp = Date.now() - 2000;
+      const failureTimestamp = Date.now() - 1000;
+      const route = await vm.route(
+        buildRequest({
+          reason: 'user',
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'stop',
+              timestamp: successTimestamp,
+            },
+            {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: 'insufficient_quota',
+              timestamp: failureTimestamp,
+            },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      // The success (t1) predates the failure's own event time (t2), so it
+      // must not clear the cooldown the failure arms.
+      expect(route.model.id).toBe('gemini-1.5-flash');
+      expect(
+        mockState.cooldownStore!.load().entries['openai/gpt-4o-mini'],
+      ).toBeDefined();
+    });
+
+    describe('review 5: malformed numeric transcript timestamps never escape route()', () => {
+      // Pre-fix, provider.ts accepted any numeric candidate.timestamp as-is
+      // and forwarded it straight to cooldownStore.record() as recordedAt;
+      // record() built the cooldown entry (iso(recordedAt)) outside its own
+      // try/catch, so a non-finite or out-of-Date-range transcript timestamp
+      // threw a RangeError out of route() instead of being ignored.
+      it.each([
+        ['1e20', 1e20],
+        ['NaN', NaN],
+        ['Infinity', Infinity],
+        ['-1', -1],
+      ])(
+        'route() still returns a routed model for a transcript failure timestamped %s',
+        async (_label, timestamp) => {
+          // processStartTime far below every malformed value (including -1)
+          // so none of them are filtered out by the "before this process
+          // started" check before ever reaching the timestamp validity guard.
+          Object.assign(mockState, { processStartTime: -1e21 });
+          registerRouterProvider(mockPi, mockState, mockActions);
+          const vm = registeredVirtualModels.get('router/balanced')!;
+
+          const route = await vm.route(
+            buildRequest({
+              reason: 'user',
+              messages: [
+                {
+                  role: 'user',
+                  content: 'fix this bug',
+                  timestamp: Date.now(),
+                },
+                {
+                  ...createAssistantMsg('', 0),
+                  provider: 'openai',
+                  model: 'gpt-4o-mini',
+                  stopReason: 'error',
+                  errorMessage: 'insufficient_quota',
+                  timestamp,
+                },
+              ],
+            }),
+            mockState.lastExtensionContext!,
+          );
+
+          expect(route.model).toBeDefined();
+        },
+      );
+
+      it('route() still returns a routed model for a transcript success timestamped 1e20', async () => {
+        Object.assign(mockState, { processStartTime: -1e21 });
+        registerRouterProvider(mockPi, mockState, mockActions);
+        const vm = registeredVirtualModels.get('router/balanced')!;
+
+        const route = await vm.route(
+          buildRequest({
+            reason: 'user',
+            messages: [
+              {
+                role: 'user',
+                content: 'fix this bug',
+                timestamp: Date.now(),
+              },
+              {
+                ...createAssistantMsg('', 0),
+                provider: 'openai',
+                model: 'gpt-4o-mini',
+                stopReason: 'stop',
+                timestamp: 1e20,
+              },
+            ],
+          }),
+          mockState.lastExtensionContext!,
+        );
+
+        expect(route.model).toBeDefined();
+      });
+    });
+
+    describe('review 5: structural guard -- a throwing CooldownStore never breaks route()', () => {
+      it('route() still returns a routed model when every CooldownStore method throws', async () => {
+        const throwingStore: CooldownStore = {
+          load: () => {
+            throw new Error('boom: load');
+          },
+          record: () => {
+            throw new Error('boom: record');
+          },
+          noteSuccess: () => {
+            throw new Error('boom: noteSuccess');
+          },
+          candidates: () => {
+            throw new Error('boom: candidates');
+          },
+          clear: () => {
+            throw new Error('boom: clear');
+          },
+          formatStatus: () => {
+            throw new Error('boom: formatStatus');
+          },
+        };
+        Object.assign(mockState, { cooldownStore: throwingStore });
+        const errorSpy = vi
+          .spyOn(console, 'error')
+          .mockImplementation(() => {});
+        registerRouterProvider(mockPi, mockState, mockActions);
+        const vm = registeredVirtualModels.get('router/balanced')!;
+
+        const route = await vm.route(
+          buildRequest({
+            messages: [
+              { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            ],
+          }),
+          mockState.lastExtensionContext!,
+        );
+
+        expect(route.model).toBeDefined();
+        errorSpy.mockRestore();
+      });
+
+      it('a throwing CooldownStore still lets a retry fall back to another model', async () => {
+        const throwingStore: CooldownStore = {
+          load: () => {
+            throw new Error('boom: load');
+          },
+          record: () => {
+            throw new Error('boom: record');
+          },
+          noteSuccess: () => {
+            throw new Error('boom: noteSuccess');
+          },
+          candidates: () => {
+            throw new Error('boom: candidates');
+          },
+          clear: () => {
+            throw new Error('boom: clear');
+          },
+          formatStatus: () => {
+            throw new Error('boom: formatStatus');
+          },
+        };
+        Object.assign(mockState, { cooldownStore: throwingStore });
+        const errorSpy = vi
+          .spyOn(console, 'error')
+          .mockImplementation(() => {});
+        registerRouterProvider(mockPi, mockState, mockActions);
+        const vm = registeredVirtualModels.get('router/balanced')!;
+
+        const initialRoute = await vm.route(
+          buildRequest({
+            messages: [
+              { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            ],
+          }),
+          mockState.lastExtensionContext!,
+        );
+
+        const retry = await vm.route(
+          buildRequest({
+            reason: 'retry',
+            state: initialRoute.state,
+            failed: {
+              model: createTestModel({ provider: 'openai', id: 'gpt-4o-mini' }),
+              thinkingLevel: 'medium',
+              message: {
+                ...createAssistantMsg('', 0),
+                provider: 'openai',
+                model: 'gpt-4o-mini',
+                stopReason: 'error',
+                errorMessage: '429 Too Many Requests',
+              },
+            },
+          }),
+          mockState.lastExtensionContext!,
+        );
+
+        expect(retry.model).toBeDefined();
+        errorSpy.mockRestore();
+      });
     });
   });
 

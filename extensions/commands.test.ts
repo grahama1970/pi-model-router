@@ -1,7 +1,11 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Api, Model } from '@earendil-works/pi-ai';
 import type { AutocompleteItem } from '@earendil-works/pi-tui';
 import { registerCommands } from './commands';
+import { createCooldownStore } from './cooldown';
 import type {
   RouterConfig,
   RoutingDecision,
@@ -1035,6 +1039,149 @@ describe('commands.ts', () => {
         'Usage: /router debug <on|off|show|clear>',
         'error',
       );
+    });
+  });
+
+  describe('handleCooldowns edge cases', () => {
+    let cooldownDir: string;
+
+    beforeEach(() => {
+      cooldownDir = mkdtempSync(join(tmpdir(), 'pmr-commands-cooldown-'));
+    });
+
+    afterEach(() => {
+      rmSync(cooldownDir, { recursive: true, force: true });
+    });
+
+    const buildStateWithCooldownStore = () => ({
+      ...buildDefaultState(),
+      cooldownStore: createCooldownStore(
+        join(cooldownDir, 'cooldowns'),
+        () => Date.parse('2026-11-01T00:00:00Z'),
+        join(cooldownDir, 'provider-switch.json'),
+      ),
+    });
+
+    it('should notify there are no active cooldowns', async () => {
+      const pi = buildMockPi();
+      const state = buildStateWithCooldownStore();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('cooldowns', ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'No active cooldowns.',
+        'info',
+      );
+    });
+
+    it('should list an active cooldown', async () => {
+      const pi = buildMockPi();
+      const state = buildStateWithCooldownStore();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+      state.cooldownStore.record(
+        'zai/glm-5.3',
+        'retry in 10 min',
+        'retry',
+        state.currentConfig,
+      );
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('cooldowns', ctx);
+      const [message] = ctx.ui.notify.mock.calls[0];
+      expect(message).toContain('zai/glm-5.3');
+    });
+
+    it('should clear a single cooldown with "clear <provider/model>"', async () => {
+      const pi = buildMockPi();
+      const state = buildStateWithCooldownStore();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+      state.cooldownStore.record(
+        'zai/glm-5.3',
+        'retry in 10 min',
+        'retry',
+        state.currentConfig,
+      );
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('cooldown clear zai/glm-5.3', ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'Cooldown cleared: zai/glm-5.3',
+        'info',
+      );
+      expect(state.cooldownStore.load().entries['zai/glm-5.3']).toBeUndefined();
+      expect(actions.updateStatus).toHaveBeenCalled();
+    });
+
+    it('should clear every cooldown with "clear all"', async () => {
+      const pi = buildMockPi();
+      const state = buildStateWithCooldownStore();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+      state.cooldownStore.record(
+        'zai/glm-5.3',
+        'retry in 10 min',
+        'retry',
+        state.currentConfig,
+      );
+      state.cooldownStore.record(
+        'moonshot/kimi',
+        'retry in 10 min',
+        'retry',
+        state.currentConfig,
+      );
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('cooldown clear all', ctx);
+      expect(state.cooldownStore.load().entries).toEqual({});
+    });
+
+    it('should show usage on invalid cooldown subcommand', async () => {
+      const pi = buildMockPi();
+      const state = buildStateWithCooldownStore();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('cooldown bogus', ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'Usage: /router cooldowns [clear <provider/model|all>]',
+        'error',
+      );
+    });
+
+    it('should include a Cooldowns section in /router status', async () => {
+      const pi = buildMockPi();
+      const state = buildStateWithCooldownStore();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+      state.cooldownStore.record(
+        'zai/glm-5.3',
+        'retry in 10 min',
+        'retry',
+        state.currentConfig,
+      );
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('', ctx);
+      const [message] = ctx.ui.notify.mock.calls[0];
+      expect(message).toContain('Cooldowns:');
+      expect(message).toContain('zai/glm-5.3');
     });
   });
 

@@ -232,6 +232,7 @@ export interface RouterConfig {
   rules?: RoutingRule[];
   profiles: Record<string, RouterProfile>;
   models?: Record<string, ModelDefinition>;
+  providerTimezones?: Record<string, string>;
 }
 
 export interface RoutingDecision {

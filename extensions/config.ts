@@ -139,6 +139,10 @@ export const mergeConfig = (
     rules: override.rules ?? base.rules,
     profiles: mergedProfiles,
     models: Object.keys(mergedModels).length > 0 ? mergedModels : undefined,
+    providerTimezones: {
+      ...(base.providerTimezones ?? {}),
+      ...(override.providerTimezones ?? {}),
+    },
   };
 };
 
@@ -418,6 +422,17 @@ export const normalizeConfig = (
 
   const maxSessionBudget = parsePositiveNumber(raw.maxSessionBudget);
 
+  const providerTimezones: Record<string, string> = {};
+  if (isObjectRecord(raw.providerTimezones)) {
+    for (const [provider, timezone] of Object.entries(raw.providerTimezones)) {
+      if (typeof timezone !== 'string' || timezone.trim() === '') {
+        warnings.push(`Ignored invalid timezone for provider "${provider}".`);
+      } else {
+        providerTimezones[provider] = timezone.trim();
+      }
+    }
+  }
+
   const rules: RoutingRule[] = [];
   if (Array.isArray(raw.rules)) {
     for (const rule of raw.rules) {
@@ -505,6 +520,10 @@ export const normalizeConfig = (
       rules: rules.length > 0 ? rules : undefined,
       profiles: normalizedProfiles,
       models: hasModels ? normalizedModels : undefined,
+      providerTimezones:
+        Object.keys(providerTimezones).length > 0
+          ? providerTimezones
+          : undefined,
     },
     warnings,
   };

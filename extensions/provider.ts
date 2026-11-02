@@ -37,6 +37,11 @@ import {
   hasImageAttachment,
 } from './routing';
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from './constants';
+import {
+  classifyLimitError,
+  isValidEventTimestamp,
+  type CooldownStore,
+} from './cooldown';
 
 const countedMessages = new WeakSet<object>();
 
@@ -156,6 +161,13 @@ export interface RouterProviderState<TContext = ExtensionContext> {
   readonly thinkingByProfile: RouterThinkingByProfile;
   readonly pinnedTierByProfile: RouterPinByProfile;
   accumulatedCost: number;
+  readonly cooldownStore?: CooldownStore;
+  // When this process started, and which transcript-observed limit-error
+  // message timestamps it has already turned into a cooldown. Both are
+  // in-memory only (never persisted): a historical error from before this
+  // process started, or one already processed this run, is never re-recorded.
+  readonly processStartTime: number;
+  readonly processedTranscriptFailures: Set<string>;
 }
 
 export interface RouterProviderActions<TContext = ExtensionContext> {
@@ -168,6 +180,36 @@ export interface RouterProviderActions<TContext = ExtensionContext> {
   updateStatus: (ctx: TContext) => void;
   syncPiThinkingLevel: (level: ThinkingLevel | undefined) => void;
 }
+
+// Cooldowns are an advisory routing hint, never a correctness mechanism: a
+// turn must never fail because the (possibly caller-supplied, possibly
+// malformed) CooldownStore threw. Every failure here is logged at most once
+// and degrades to "route as if no cooldown existed" rather than throwing out
+// of route().
+const loggedCooldownErrors = new Set<string>();
+const logCooldownErrorOnce = (context: string, error: unknown): void => {
+  const message = `pi-model-router: cooldown ${context} failed: ${String(error)}`;
+  if (loggedCooldownErrors.has(message)) return;
+  loggedCooldownErrors.add(message);
+  console.error(message);
+};
+
+// Shared by every candidates()-filtering call site in route(): a throwing
+// CooldownStore (e.g. a misbehaving stub, not just our own createCooldownStore)
+// must fall back to the unfiltered candidate list instead of breaking the turn.
+const filterCooldownCandidates = (
+  store: CooldownStore,
+  modelRefs: string[],
+  now: number,
+  isUsable: (ref: string) => boolean,
+): string[] => {
+  try {
+    return store.candidates(modelRefs, now, isUsable);
+  } catch (error) {
+    logCooldownErrorOnce('candidates', error);
+    return modelRefs;
+  }
+};
 
 export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
   request: ModelRouteRequest<VirtualRouterState>,
@@ -238,6 +280,13 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
       };
     };
 
+    // Cooldown filtering must only act on resolvable, authenticated candidates:
+    // an unresolvable or unauthenticated model would fail resolution regardless
+    // of cooldown state, so it must never be chosen as the "soonest-expiring"
+    // fallback when everything usable is cooling.
+    const isUsableCandidate = (modelRef: string): boolean =>
+      resolveCandidate(modelRef).ok;
+
     const resolveFirstAvailableModel = (candidates: string[]) => {
       let lastError: unknown;
       for (let i = 0; i < candidates.length; i++) {
@@ -288,6 +337,126 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
       return { effectiveThinking, delegatedThinking };
     };
 
+    const cooldownStore = state.cooldownStore;
+    const cooldownNow = Date.now();
+    if (cooldownStore) {
+      // Every cooldown touchpoint below (the retry record, the transcript
+      // failure scan, and the transcript success scan) is wrapped in one
+      // try/catch: a throw from any of them -- including from a malformed or
+      // deliberately hostile CooldownStore, not just our own
+      // createCooldownStore -- must degrade to "no cooldown recorded this
+      // turn" instead of breaking the turn.
+      try {
+        const failedText = request.failed?.message.errorMessage ?? '';
+        if (
+          request.reason === 'retry' &&
+          request.failed &&
+          classifyLimitError(failedText)
+        ) {
+          cooldownStore.record(
+            `${request.failed.model.provider}/${request.failed.model.id}`,
+            failedText,
+            'retry',
+            state.currentConfig,
+            cooldownNow,
+          );
+        }
+
+        // Transcript scan: only a NEW assistant error (timestamped after this
+        // process started, and not already recorded by this process) is turned
+        // into a cooldown. Dedup is a plain in-memory set, never persisted, so a
+        // historical failure can never be re-armed after a restart or an
+        // explicit `/router cooldown clear` — there's nothing on disk to replay.
+        for (const message of request.messages) {
+          if (!isObjectRecord(message)) continue;
+          const candidate = message as unknown as Record<string, unknown>;
+          if (
+            candidate.role !== 'assistant' ||
+            candidate.stopReason !== 'error'
+          )
+            continue;
+          // A malformed numeric timestamp (NaN, Infinity, 1e20, or anything
+          // outside Date's representable range) must never reach record():
+          // ignore that transcript message for cooldown purposes instead of
+          // letting an invalid recorded_at escape to iso().
+          const timestamp =
+            typeof candidate.timestamp === 'number' &&
+            isValidEventTimestamp(candidate.timestamp)
+              ? candidate.timestamp
+              : undefined;
+          if (timestamp === undefined || timestamp <= state.processStartTime)
+            continue;
+          const identity = String(timestamp);
+          if (state.processedTranscriptFailures.has(identity)) continue;
+          const provider =
+            typeof candidate.provider === 'string' ? candidate.provider : '';
+          const model =
+            typeof candidate.model === 'string' ? candidate.model : '';
+          const errorMessage =
+            typeof candidate.errorMessage === 'string'
+              ? candidate.errorMessage
+              : '';
+          if (!provider || !model || !classifyLimitError(errorMessage))
+            continue;
+          state.processedTranscriptFailures.add(identity);
+          // recordedAt is the failed message's own (event) timestamp, not
+          // cooldownNow (scan time): noteSuccess below compares a success
+          // message's timestamp against this recorded_at, and a success that
+          // is genuinely newer than the failure must clear it even though
+          // both timestamps predate the scan that observed them. Only the
+          // expiry math (cooldownNow) stays anchored to real wall-clock time.
+          cooldownStore.record(
+            `${provider}/${model}`,
+            errorMessage,
+            'transcript',
+            state.currentConfig,
+            cooldownNow,
+            timestamp,
+          );
+        }
+
+        // A success only clears a model's cooldown when it's actually newer
+        // than the failure that armed it: an older success already sitting in
+        // the transcript (processed again on every turn) must never erase a
+        // cooldown recorded from a later failure. noteSuccess enforces this
+        // against the model's own recorded_at; the processStartTime check here
+        // additionally drops successes that predate this process, matching the
+        // same rule already applied to transcript-sourced failures above.
+        for (const message of request.messages) {
+          if (!isObjectRecord(message)) continue;
+          const candidate = message as unknown as Record<string, unknown>;
+          if (candidate.role !== 'assistant') continue;
+          if (
+            candidate.stopReason === 'error' ||
+            candidate.stopReason === 'aborted'
+          )
+            continue;
+          // Same malformed-timestamp guard as the failure scan above.
+          const successTimestamp =
+            typeof candidate.timestamp === 'number' &&
+            isValidEventTimestamp(candidate.timestamp)
+              ? candidate.timestamp
+              : undefined;
+          if (
+            successTimestamp === undefined ||
+            successTimestamp <= state.processStartTime
+          )
+            continue;
+          if (
+            typeof candidate.provider === 'string' &&
+            typeof candidate.model === 'string'
+          ) {
+            cooldownStore.noteSuccess(
+              `${candidate.provider}/${candidate.model}`,
+              successTimestamp,
+            );
+          }
+        }
+      } catch (error) {
+        logCooldownErrorOnce('record/transcript-scan', error);
+      }
+    }
+
     const pinnedTier = state.pinnedTierByProfile[profileName];
     const previousDecision =
       request.state?.lastDecision?.profile === profileName
@@ -317,7 +486,15 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
           ? previousDecision.targetLabel
           : undefined,
       );
-      const resolved = resolveFirstAvailableModel(candidates);
+      const cooledCandidates = cooldownStore
+        ? filterCooldownCandidates(
+            cooldownStore,
+            candidates,
+            cooldownNow,
+            isUsableCandidate,
+          )
+        : candidates;
+      const resolved = resolveFirstAvailableModel(cooledCandidates);
       const { delegatedThinking } = resolveDelegatedThinking(
         directTier,
         resolved.modelRef,
@@ -497,6 +674,15 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
       if (modelsToTry.length === 0) {
         modelsToTry = [preferredModel];
       }
+    }
+
+    if (cooldownStore) {
+      modelsToTry = filterCooldownCandidates(
+        cooldownStore,
+        modelsToTry,
+        cooldownNow,
+        isUsableCandidate,
+      );
     }
 
     // On retry, rotate candidates so models after the failed model are attempted first.

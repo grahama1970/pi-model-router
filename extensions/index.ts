@@ -31,6 +31,7 @@ import {
   markMessageCostCounted,
   extractUncountedMessageCost,
 } from './provider';
+import { createCooldownStore } from './cooldown';
 
 const routerExtension = <
   TCtx extends RouterExtensionContext = ExtensionContext,
@@ -52,6 +53,9 @@ const routerExtension = <
     debugHistory: [] as RoutingDecision[],
     lastNonRouterModel: undefined as string | undefined,
     accumulatedCost: 0,
+    cooldownStore: createCooldownStore(),
+    processStartTime: Date.now(),
+    processedTranscriptFailures: new Set<string>(),
     lastExtensionContext: undefined as TCtx | undefined,
     lastConfigWarnings: [] as string[],
   };

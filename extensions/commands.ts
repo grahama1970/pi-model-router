@@ -12,6 +12,7 @@ import type {
   RouterTier,
   RouterCommandContext,
 } from './types';
+import type { CooldownStore } from './cooldown';
 import {
   profileNames,
   THINKING_LEVELS,
@@ -61,6 +62,7 @@ export const registerCommands = <
     widgetEnabled: boolean;
     readonly debugHistory: RoutingDecision[];
     readonly lastConfigWarnings: string[];
+    readonly cooldownStore?: CooldownStore;
   },
   actions: {
     persistState: () => void;
@@ -87,6 +89,8 @@ export const registerCommands = <
     },
     { name: 'widget', desc: 'Toggle the router status widget' },
     { name: 'debug', desc: 'Toggle or clear router debug history' },
+    { name: 'cooldowns', desc: 'Show shared model cooldowns' },
+    { name: 'cooldown', desc: 'Clear shared model cooldowns' },
     { name: 'reload', desc: 'Reload the model router configuration' },
     { name: 'help', desc: 'Show usage help for subcommands' },
   ];
@@ -197,6 +201,12 @@ export const registerCommands = <
       `Debug: ${state.debugEnabled ? 'on' : 'off'}`,
       `Debug history: ${state.debugHistory.length} decisions`,
     ];
+    const cooldownLines = state.cooldownStore?.formatStatus() ?? [];
+    lines.push(
+      '',
+      'Cooldowns:',
+      ...(cooldownLines.length > 0 ? cooldownLines : ['none']),
+    );
     if (state.lastDecision) {
       lines.push(
         `Last routed tier: ${state.lastDecision.tier}`,
@@ -476,6 +486,29 @@ export const registerCommands = <
     );
   };
 
+  const handleCooldowns = async (args: string[], ctx: TCtx) => {
+    if (args.length === 0) {
+      const lines = state.cooldownStore?.formatStatus() ?? [];
+      ctx.ui.notify(
+        lines.length > 0
+          ? `Cooldowns:\n${lines.join('\n')}`
+          : 'No active cooldowns.',
+        'info',
+      );
+      return;
+    }
+    if (args[0] === 'clear' && args.length === 2 && state.cooldownStore) {
+      state.cooldownStore.clear(args[1]);
+      ctx.ui.notify(`Cooldown cleared: ${args[1]}`, 'info');
+      actions.updateStatus(ctx);
+      return;
+    }
+    ctx.ui.notify(
+      'Usage: /router cooldowns [clear <provider/model|all>]',
+      'error',
+    );
+  };
+
   const handleReload = async (args: string[], ctx: TCtx) => {
     if (args.length > 0) {
       ctx.ui.notify('Usage: /router reload (no arguments)', 'error');
@@ -605,6 +638,10 @@ export const registerCommands = <
           break;
         case 'debug':
           await handleDebug(subArgs, ctx);
+          break;
+        case 'cooldowns':
+        case 'cooldown':
+          await handleCooldowns(subArgs, ctx);
           break;
         case 'reload':
           await handleReload(subArgs, ctx);

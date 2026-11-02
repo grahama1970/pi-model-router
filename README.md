@@ -98,6 +98,7 @@ An explicit `/router thinking` override takes precedence over a per-fallback lev
 | `phaseBias`                | (0.0 - 1.0) Stickiness of the current phase. Higher = more stable. Default `0.5`.                                                                                                                                                                                        |
 | `rules`                    | List of custom keyword rules (e.g. `{ "matches": "deploy", "tier": "high" }`).                                                                                                                                                                                           |
 | `models`                   | (Optional) Map of model aliases to definitions with `model`, `contextWindow`, `maxTokens`.                                                                                                                                                                               |
+| `providerTimezones`        | (Optional) IANA timezone overrides for provider reset timestamps that omit a timezone.                                                                                                                                                                                   |
 | `profiles`                 | Map of profile definitions, each containing optional `high`, `medium`, and `low` tiers (at least one required). Tier models can reference aliases from `models`.                                                                                                         |
 
 ### Local & Custom Models (`llama.cpp`, Ollama, LM Studio)
@@ -146,20 +147,26 @@ Then reference `"llama-local/qwen3-coder"` in your `model-router.json` tiers or 
 
 ## Commands
 
-| Command                           | Description                                                                                                       |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `/router`                         | Show detailed status, current profile, spend, and settings.                                                       |
-| `/router status`                  | Alias for `/router` (show current status).                                                                        |
-| `/router profile [name]`          | Switch to a profile or list available ones (enables router if off).                                               |
-| `/router pin <t\|a>`              | Pin a tier (high/medium/low/auto) for the active profile.                                                         |
-| `/router fix <tier>`              | Correct the _last_ decision and pin that tier for the current profile.                                            |
-| `/router thinking <level>`        | Override thinking level for all tiers (e.g. `/router thinking max`). Not all tier models may support every level. |
-| `/router thinking <tier> <level>` | Override thinking level for a specific tier (e.g. `/router thinking low off`).                                    |
-| `/router disable`                 | Disable the router and switch back to the last non-router model.                                                  |
-| `/router widget <on\|off>`        | Toggle the persistent state widget (supports `toggle`).                                                           |
-| `/router debug <on\|off>`         | Toggle turn-by-turn routing notifications (supports `toggle`, `clear`, `show`).                                   |
-| `/router reload`                  | Hot-reload the configuration JSON.                                                                                |
-| `/router help`                    | Show usage help for all subcommands.                                                                              |
+| Command                             | Description                                                                                                       |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `/router`                           | Show detailed status, current profile, spend, and settings.                                                       |
+| `/router status`                    | Alias for `/router` (show current status).                                                                        |
+| `/router profile [name]`            | Switch to a profile or list available ones (enables router if off).                                               |
+| `/router pin <t\|a>`                | Pin a tier (high/medium/low/auto) for the active profile.                                                         |
+| `/router fix <tier>`                | Correct the _last_ decision and pin that tier for the current profile.                                            |
+| `/router thinking <level>`          | Override thinking level for all tiers (e.g. `/router thinking max`). Not all tier models may support every level. |
+| `/router thinking <tier> <level>`   | Override thinking level for a specific tier (e.g. `/router thinking low off`).                                    |
+| `/router disable`                   | Disable the router and switch back to the last non-router model.                                                  |
+| `/router widget <on\|off>`          | Toggle the persistent state widget (supports `toggle`).                                                           |
+| `/router debug <on\|off>`           | Toggle turn-by-turn routing notifications (supports `toggle`, `clear`, `show`).                                   |
+| `/router cooldowns`                 | Show cooldowns merged across Pi sessions, including local and UTC reset times.                                    |
+| `/router cooldown clear <ref\|all>` | Clear one cooldown (`provider/model`) or all cooldowns for this session.                                          |
+| `/router reload`                    | Hot-reload the configuration JSON.                                                                                |
+| `/router help`                      | Show usage help for all subcommands.                                                                              |
+
+## Shared cooldowns
+
+Rate-limit cooldowns are advisory and best-effort: a provider limit error is never allowed to make a session unresponsive. Each Pi process writes its own cooldown file under `~/.local/state/pi-model-router/cooldowns/` (override the directory with `PI_MODEL_ROUTER_COOLDOWNS`), and every session merges all sessions' files to decide which models are cooling down - no locks, no cross-session coordination required. Reset timestamps without a timezone use provider defaults; configure `providerTimezones` when needed. Use `/router cooldowns` to inspect merged state and `/router cooldown clear all` to clear it for this session.
 
 ## Documentation
 

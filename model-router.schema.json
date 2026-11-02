@@ -56,6 +56,14 @@
       "exclusiveMinimum": 0,
       "description": "Maximum session spend in USD. Once exceeded, high-tier requests automatically downgrade to medium."
     },
+    "providerTimezones": {
+      "type": "object",
+      "description": "IANA timezone overrides for provider reset timestamps without an explicit timezone.",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "models": {
       "type": "object",
       "description": "Map of reusable model aliases to model definitions and capability overrides.",
