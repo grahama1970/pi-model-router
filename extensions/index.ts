@@ -12,6 +12,7 @@ import {
   type CustomSessionEntry,
 } from './types';
 import {
+  isObjectRecord,
   loadRouterConfig,
   profileNames,
   resolveProfileName,
@@ -32,6 +33,7 @@ import {
   extractUncountedMessageCost,
   resolveRoutedCandidate,
   getTierModels,
+  selectRoutedCandidates,
 } from './provider';
 import { createCooldownStore } from './cooldown';
 import { loadAccountRegistry, registerPersistedAccounts } from './accounts';
@@ -42,6 +44,17 @@ import {
   logAutoContinueErrorOnce,
   resetAutoContinueGuardOnSettle,
 } from './autocontinue';
+import {
+  conversationHasImage,
+  createEncryptedReasoningRecoveryState,
+  ENCRYPTED_REJECTION_ENTRY_TYPE,
+  evaluateBeforeSettleForEncryptedReasoning,
+  isEncryptedRejectionRecord,
+  observeEncryptedReasoningFailure,
+  rejectionRecordKey,
+  resetEncryptedReasoningRecoveryOnSettle,
+  type EncryptedRejectionRecord,
+} from './encrypted-reasoning';
 
 const routerExtension = <
   TCtx extends RouterExtensionContext = ExtensionContext,
@@ -80,6 +93,21 @@ const routerExtension = <
     // processedTranscriptFailures above.
     autoContinueGuard: createAutoContinueGuardState(),
     pendingAutoContinueNotice: undefined as { failedRef: string } | undefined,
+    // Encrypted-reasoning recovery (extensions/encrypted-reasoning.ts):
+    // same in-memory, session-scoped lifetime as the auto-continue guard.
+    // The conversation-scoped model exclusion is NOT stored here -- route()
+    // derives it from the request's own history on every call.
+    encryptedReasoningRecovery: createEncryptedReasoningRecoveryState(),
+    // Durable, signature-bound encrypted-reasoning rejections for THIS
+    // session (extensions/encrypted-reasoning.ts's
+    // `EncryptedRejectionRecord`). Seeded from the session's custom entries on
+    // session_start/session_tree and extended whenever a rejection is observed,
+    // so the exclusion outlives the projectional error message and survives a
+    // restart or a branch summary that keeps the signed response.
+    encryptedRejections: [] as EncryptedRejectionRecord[],
+    pendingEncryptedReasoningNotice: undefined as
+      | { failedRef: string }
+      | undefined,
     lastExtensionContext: undefined as TCtx | undefined,
     lastConfigWarnings: [] as string[],
   };
@@ -284,6 +312,54 @@ const routerExtension = <
     registerRouterProvider: () => {
       registerRouterProvider(pi, state, actions);
     },
+    // Reads every rejection record this SESSION holds, from Pi's own
+    // `sessionManager.getEntries()` (all entries, not just the active branch):
+    // a branch summary that abandons the rejecting assistant message keeps the
+    // record readable, while the fingerprint rule in
+    // `collectEncryptedReasoningExclusions` decides whether it still applies.
+    refreshEncryptedRejections: (ctx: TCtx) => {
+      try {
+        const entries = ctx.sessionManager.getEntries?.() ?? [];
+        const records: EncryptedRejectionRecord[] = [];
+        const seen = new Set<string>();
+        for (const entry of entries) {
+          if (
+            entry.type !== 'custom' ||
+            entry.customType !== ENCRYPTED_REJECTION_ENTRY_TYPE
+          ) {
+            continue;
+          }
+          if (!isEncryptedRejectionRecord(entry.data)) continue;
+          const key = rejectionRecordKey(entry.data);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          records.push(entry.data);
+        }
+        state.encryptedRejections = records;
+      } catch {
+        // Advisory: keep the records already in memory on any failure.
+      }
+    },
+    // Persists one rejection as idempotent session metadata. Called by the
+    // agent_before_settle decision and by route() (for a rejection that only
+    // `request.failed` carried), never throws.
+    recordEncryptedRejection: (record: EncryptedRejectionRecord) => {
+      try {
+        const key = rejectionRecordKey(record);
+        if (
+          state.encryptedRejections.some(
+            (existing) => rejectionRecordKey(existing) === key,
+          )
+        ) {
+          return;
+        }
+        state.encryptedRejections = [...state.encryptedRejections, record];
+        pi.appendEntry(ENCRYPTED_REJECTION_ENTRY_TYPE, record);
+      } catch {
+        // Advisory: routing already excludes the model for this request from
+        // the rejection message itself.
+      }
+    },
     reregisterAccounts: (ctx: TCtx) => {
       registerPersistedAccounts(
         state.accountRegistry,
@@ -308,6 +384,7 @@ const routerExtension = <
     // models via actions.registerRouterProvider() above.
     state.accountRegistry = loadAccountRegistry();
     actions.reregisterAccounts(ctx);
+    actions.refreshEncryptedRejections(ctx);
 
     state.routerEnabled = ctx.model?.provider === 'router';
     state.selectedProfile =
@@ -436,6 +513,7 @@ const routerExtension = <
       actions.reloadConfig(ctx);
       state.accountRegistry = loadAccountRegistry();
       actions.reregisterAccounts(ctx);
+      actions.refreshEncryptedRejections(ctx);
     }
   };
 
@@ -529,6 +607,56 @@ const routerExtension = <
     }
   };
 
+  // Requires at least one remaining ELIGIBLE candidate, computed with the exact
+  // same function route() uses (`selectRoutedCandidates`): same profile, tier,
+  // image requirement, encrypted-reasoning exclusion set, and cooldown state.
+  // Sharing the calculation is what guarantees the continuation can never be
+  // requested for a chain that routing would then refuse to serve, and that a
+  // cooling model's "keep the soonest-expiring one" fallback can never bring a
+  // rejected model back.
+  // API identity for the encrypted-reasoning exclusions: Pi replays a signed
+  // block only to the same provider + API + model, so a record bound under one
+  // API must not exclude a target whose API changed.
+  const resolveRoutedModelApi = (modelRef: string): string | undefined => {
+    try {
+      const registry = state.currentModelRegistry;
+      if (!registry) return undefined;
+      const resolved = resolveRoutedCandidate(modelRef, registry);
+      return resolved.ok ? resolved.model.api : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const hasUsableEncryptedReasoningReplacement = (
+    failedRef: string,
+    excludedRefs: ReadonlySet<string>,
+    contextMessages: readonly unknown[],
+  ): boolean => {
+    try {
+      const registry = state.currentModelRegistry;
+      const profileName = state.selectedProfile;
+      const tier = state.lastDecision?.tier;
+      if (!registry || !profileName || !tier) return false;
+      const profile = state.currentConfig.profiles[profileName];
+      if (!profile) return false;
+      const selection = selectRoutedCandidates({
+        profile,
+        tier,
+        preferredModel: state.lastDecision?.targetLabel,
+        requiresImage: conversationHasImage(contextMessages),
+        registry,
+        excludedRefs,
+        cooldownStore: state.cooldownStore,
+        now: Date.now(),
+        failedRef,
+      });
+      return selection.refs.length > 0 && selection.refs[0] !== failedRef;
+    } catch {
+      return false;
+    }
+  };
+
   pi.on('agent_before_settle', async (event, ctx) => {
     ensureInitializedFromContext(ctx);
 
@@ -544,7 +672,57 @@ const routerExtension = <
         isAutoContinueRefStillCooling,
         hasUsableAutoContinueReplacement,
       );
-      if (!decision) return undefined;
+      if (!decision) {
+        // Independent second recovery path: a model that rejected this
+        // conversation's replayed encrypted reasoning (see
+        // extensions/encrypted-reasoning.ts) has no chance of succeeding on
+        // a retry, so continue on a different model the same way a user
+        // would switch models by hand. The usage-limit path above keeps its
+        // exact behavior; an encrypted-reasoning error is never
+        // limit-classified, so the two never contend for the same failure.
+        //
+        // The observed rejection is recorded BEFORE the continuation decision
+        // and independently of it: at final exhaustion (every candidate has
+        // rejected) no continuation is requested, yet this failure's signature
+        // binding must still be persisted -- otherwise a later branch summary
+        // that keeps this model's signed response while dropping the error
+        // would leave it selectable again, replaying the rejected payload.
+        try {
+          const contextMessages =
+            isObjectRecord(event) &&
+            isObjectRecord(event.context) &&
+            Array.isArray(event.context.contextMessages)
+              ? (event.context.contextMessages as readonly unknown[])
+              : [];
+          const observation = observeEncryptedReasoningFailure({
+            messages: contextMessages,
+            at: Date.now(),
+          });
+          if (observation?.record) {
+            actions.recordEncryptedRejection(observation.record);
+          }
+        } catch {
+          // Advisory: a metadata write failure must never block settling.
+        }
+
+        const reasoningRecovery = evaluateBeforeSettleForEncryptedReasoning(
+          event,
+          state.encryptedReasoningRecovery,
+          hasUsableEncryptedReasoningReplacement,
+          state.encryptedRejections,
+          resolveRoutedModelApi,
+        );
+        if (!reasoningRecovery) return undefined;
+        if (reasoningRecovery.armNotice) {
+          state.pendingEncryptedReasoningNotice = {
+            failedRef: reasoningRecovery.failedRef,
+          };
+        }
+        return {
+          entries: reasoningRecovery.entries,
+          continue: reasoningRecovery.continue,
+        };
+      }
 
       // Record the cooldown for the failed model immediately, at decision
       // time, rather than relying on route()'s own transcript scan to catch
@@ -591,6 +769,8 @@ const routerExtension = <
     try {
       resetAutoContinueGuardOnSettle(state.autoContinueGuard);
       state.pendingAutoContinueNotice = undefined;
+      resetEncryptedReasoningRecoveryOnSettle(state.encryptedReasoningRecovery);
+      state.pendingEncryptedReasoningNotice = undefined;
     } catch (error) {
       logAutoContinueErrorOnce(error);
     }

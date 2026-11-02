@@ -42,6 +42,11 @@ import {
   isValidEventTimestamp,
   type CooldownStore,
 } from './cooldown';
+import {
+  collectEncryptedReasoningExclusions,
+  collectUnrecordedEncryptedRejections,
+  type EncryptedRejectionRecord,
+} from './encrypted-reasoning';
 
 const countedMessages = new WeakSet<object>();
 
@@ -179,6 +184,16 @@ export interface RouterProviderState<TContext = ExtensionContext> {
   // model is actually resolved (not in turn_end, which cannot know it yet),
   // then always clears this so no later call can re-fire it.
   pendingAutoContinueNotice?: { failedRef: string };
+  // Same one-shot notice channel for the encrypted-reasoning recovery
+  // (extensions/encrypted-reasoning.ts): set by extensions/index.ts's
+  // agent_before_settle handler when it requests a continuation away from a
+  // model that rejected this conversation's replayed encrypted reasoning.
+  pendingEncryptedReasoningNotice?: { failedRef: string };
+  // Durable, signature-bound rejection metadata for this session
+  // (extensions/encrypted-reasoning.ts's `EncryptedRejectionRecord`), loaded
+  // from session custom entries by extensions/index.ts and extended whenever
+  // route() or the agent_before_settle handler observes a new rejection.
+  readonly encryptedRejections?: readonly EncryptedRejectionRecord[];
 }
 
 export interface RouterProviderActions<TContext = ExtensionContext> {
@@ -197,6 +212,11 @@ export interface RouterProviderActions<TContext = ExtensionContext> {
     message: string,
     type?: 'info' | 'warning' | 'error',
   ) => void;
+  // Persists one encrypted-reasoning rejection as session metadata (an
+  // idempotent custom entry) and adds it to the in-memory record list route()
+  // reads. Advisory like everything else here: a failure must never break the
+  // request.
+  recordEncryptedRejection?: (record: EncryptedRejectionRecord) => void;
 }
 
 // Cooldowns are an advisory routing hint, never a correctness mechanism: a
@@ -281,6 +301,146 @@ export const resolveRoutedCandidate = (
   };
 };
 
+/**
+ * Inputs of the ONE candidate calculation used both by route() and by the
+ * agent_before_settle replacement check (extensions/index.ts). Sharing it is
+ * what makes the continuation decision and routing agree: the decision asks
+ * "will route() find a model?" with the same profile, tier, image
+ * requirement, exclusion set, and cooldown state route() will use.
+ */
+const lastResolutionError = (errors: readonly string[]): Error =>
+  new Error(
+    errors.length > 0
+      ? errors[errors.length - 1]
+      : 'Failed to resolve any model in the routing chain.',
+  );
+
+export interface RoutedCandidateSelectionInput {
+  profile: RouterConfig['profiles'][string];
+  tier: RouterTier;
+  preferredModel?: string;
+  requiresImage: boolean;
+  registry: RouterModelRegistry;
+  // Models excluded by the encrypted-reasoning recovery. Exclusion is
+  // mandatory: an excluded ref is never returned, and never restored when
+  // everything else is filtered out.
+  excludedRefs: ReadonlySet<string>;
+  cooldownStore?: CooldownStore;
+  now: number;
+  // The model that just failed, when route() is serving a retry: candidates
+  // configured after it are tried first.
+  failedRef?: string;
+}
+
+export interface RoutedCandidateSelection {
+  // Ordered refs route() will actually try: resolvable + authenticated,
+  // image-capable when the conversation needs it, not excluded, and
+  // cooldown-filtered. Empty means "stop" -- never a resurrected model.
+  refs: string[];
+  // Refs dropped by the encrypted-reasoning exclusions, for the stop message.
+  excludedRefs: string[];
+  // Resolution errors for configured refs that are not routable at all.
+  resolutionErrors: string[];
+}
+
+const rotateAfterFailed = (
+  refs: string[],
+  base: readonly string[],
+  failedRef: string,
+): string[] => {
+  const failedIdx = base.indexOf(failedRef);
+  if (failedIdx === -1 || refs.length <= 1) return refs;
+  const baseIndex = (ref: string): number => {
+    const index = base.indexOf(ref);
+    return index === -1 ? Number.MAX_SAFE_INTEGER : index;
+  };
+  const group = (ref: string): number => (baseIndex(ref) > failedIdx ? 0 : 1);
+  return [...refs].sort(
+    (a, b) => group(a) - group(b) || baseIndex(a) - baseIndex(b),
+  );
+};
+
+export const selectRoutedCandidates = (
+  input: RoutedCandidateSelectionInput,
+): RoutedCandidateSelection => {
+  const base = getTierModels(input.profile, input.tier, input.preferredModel);
+  const resolved = base.map((modelRef) => ({
+    modelRef,
+    result: resolveRoutedCandidate(modelRef, input.registry),
+  }));
+  const resolutionErrors = resolved
+    .filter((entry) => !entry.result.ok)
+    .map((entry) => (entry.result.ok ? '' : entry.result.error))
+    .filter((error) => error !== '');
+  const routable = resolved.filter(
+    (
+      entry,
+    ): entry is {
+      modelRef: string;
+      result: {
+        ok: true;
+        model: Model<Api>;
+        provider: string;
+        modelId: string;
+      };
+    } => entry.result.ok,
+  );
+
+  // Image compatibility behaves exactly as before: only image-capable models
+  // may replay an image-bearing conversation, and when none is configured the
+  // preferred (first) candidate remains the last resort.
+  const imageEligible = input.requiresImage
+    ? routable.filter((entry) => entry.result.model.input.includes('image'))
+    : routable;
+  const considered =
+    imageEligible.length > 0 ? imageEligible : routable.slice(0, 1);
+
+  const excludedRefs = considered
+    .filter((entry) => input.excludedRefs.has(entry.modelRef))
+    .map((entry) => entry.modelRef);
+  const eligible = considered.filter(
+    (entry) => !input.excludedRefs.has(entry.modelRef),
+  );
+  if (eligible.length === 0) {
+    return { refs: [], excludedRefs, resolutionErrors };
+  }
+  const refs = eligible.map((entry) => entry.modelRef);
+
+  // Exclusion is applied BEFORE cooldown selection, and the cooldown store's
+  // "keep the soonest-expiring usable model" fallback only ever chooses among
+  // the refs it is given -- so a cooling model can never resurrect an
+  // excluded one (the P1 this ordering fixes).
+  const cooled = input.cooldownStore
+    ? filterCooldownCandidates(
+        input.cooldownStore,
+        refs,
+        input.now,
+        (ref) => resolveRoutedCandidate(ref, input.registry).ok,
+      )
+    : refs;
+  const withoutExcluded = cooled.filter((ref) => !input.excludedRefs.has(ref));
+  const ordered = input.failedRef
+    ? rotateAfterFailed(withoutExcluded, base, input.failedRef)
+    : withoutExcluded;
+  return { refs: ordered, excludedRefs, resolutionErrors };
+};
+
+/**
+ * The clear stop message for the one case routing must never paper over: every
+ * model that could serve this tier is excluded by the encrypted-reasoning
+ * recovery. Replaying one of them can only reproduce the rejection, so route()
+ * rejects and Pi ends the run with this error instead.
+ */
+export const encryptedReasoningExhaustedMessage = (
+  profileName: string,
+  tier: RouterTier,
+  excludedRefs: readonly string[],
+): string =>
+  `pi-model-router: stopping instead of replaying rejected encrypted reasoning. ` +
+  `Every model configured for profile "${profileName}" tier "${tier}" rejected this conversation's replayed ` +
+  `encrypted reasoning (${excludedRefs.join(', ')}), so no remaining model can serve it. ` +
+  `Switch models with /model, or add another model to this tier's fallbacks.`;
+
 export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
   request: ModelRouteRequest<VirtualRouterState>,
   ctx: TContext | undefined,
@@ -309,12 +469,87 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
     const resolveCandidate = (modelRef: string) =>
       resolveRoutedCandidate(modelRef, registry);
 
-    // Cooldown filtering must only act on resolvable, authenticated candidates:
-    // an unresolvable or unauthenticated model would fail resolution regardless
-    // of cooldown state, so it must never be chosen as the "soonest-expiring"
-    // fallback when everything usable is cooling.
-    const isUsableCandidate = (modelRef: string): boolean =>
-      resolveCandidate(modelRef).ok;
+    // Encrypted-reasoning exclusions for THIS request, from both sources
+    // (extensions/encrypted-reasoning.ts):
+    //  - durable, signature-bound rejection metadata persisted in this session
+    //    (survives restarts and branch summaries that move the rejecting error
+    //    off the active path while the signed response remains), and
+    //  - the rejection messages Pi surfaces for this request: persisted
+    //    assistant errors in the projection AND `request.failed`, which is how
+    //    a retryable wrapper around the same rejection reaches routing before
+    //    Pi's retry loop re-selects a model.
+    const rejectionRecords = state.encryptedRejections ?? [];
+    // The API the registered target for a ref currently speaks: part of the
+    // replay identity (provider + API + model), so a record bound under one API
+    // never bans a target whose API changed.
+    const resolveModelApi = (ref: string): string | undefined => {
+      const resolved = resolveRoutedCandidate(ref, registry);
+      return resolved.ok ? resolved.model.api : undefined;
+    };
+    const encryptedReasoningExclusions = collectEncryptedReasoningExclusions({
+      messages: request.messages,
+      failed: request.failed?.message,
+      records: rejectionRecords,
+      resolveModelApi,
+    });
+    // Persist metadata for any rejection visible here that has none yet, so a
+    // retryable (request.failed) or foreign (projection-only) rejection becomes
+    // signature-bound session state for later requests. Advisory: a session
+    // write failure must never break the request.
+    try {
+      for (const record of collectUnrecordedEncryptedRejections({
+        messages: request.messages,
+        failed: request.failed?.message,
+        records: rejectionRecords,
+        at: Date.now(),
+      })) {
+        actions.recordEncryptedRejection?.(record);
+      }
+    } catch {
+      // Ignore: advisory bookkeeping only.
+    }
+
+    // The single candidate calculation shared with the agent_before_settle
+    // replacement check (extensions/index.ts). Exclusion is mandatory and is
+    // applied before cooldown selection and retry rotation, and when nothing
+    // survives it the request stops with a clear error instead of replaying a
+    // rejected model.
+    const selectCandidates = (input: {
+      tier: RouterTier;
+      preferredModel?: string;
+      requiresImage: boolean;
+      failedRef?: string;
+    }) =>
+      selectRoutedCandidates({
+        profile,
+        tier: input.tier,
+        preferredModel: input.preferredModel,
+        requiresImage: input.requiresImage,
+        registry,
+        excludedRefs: encryptedReasoningExclusions,
+        cooldownStore,
+        now: Date.now(),
+        failedRef: input.failedRef,
+      });
+
+    const resolveSelectedModel = (
+      selection: RoutedCandidateSelection,
+      tier: RouterTier,
+    ) => {
+      if (selection.refs.length > 0) {
+        return resolveFirstAvailableModel([selection.refs[0]]);
+      }
+      if (selection.excludedRefs.length > 0) {
+        throw new Error(
+          encryptedReasoningExhaustedMessage(
+            profileName,
+            tier,
+            selection.excludedRefs,
+          ),
+        );
+      }
+      throw lastResolutionError(selection.resolutionErrors);
+    };
 
     const resolveFirstAvailableModel = (candidates: string[]) => {
       let lastError: unknown;
@@ -507,23 +742,17 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
         profile,
         pinnedTier ?? previousDecision?.tier ?? 'medium',
       );
-      const tierConfig = profile[directTier]!;
-      const candidates = getTierModels(
-        profile,
-        directTier,
-        previousDecision?.tier === directTier
-          ? previousDecision.targetLabel
-          : undefined,
-      );
-      const cooledCandidates = cooldownStore
-        ? filterCooldownCandidates(
-            cooldownStore,
-            candidates,
-            cooldownNow,
-            isUsableCandidate,
-          )
-        : candidates;
-      const resolved = resolveFirstAvailableModel(cooledCandidates);
+      const selection = selectCandidates({
+        tier: directTier,
+        preferredModel:
+          previousDecision?.tier === directTier
+            ? previousDecision.targetLabel
+            : undefined,
+        // Compaction/summary requests never carried image filtering; keep it
+        // that way.
+        requiresImage: false,
+      });
+      const resolved = resolveSelectedModel(selection, directTier);
       const { delegatedThinking } = resolveDelegatedThinking(
         directTier,
         resolved.modelRef,
@@ -697,36 +926,22 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
         ? previousDecision.targetLabel
         : decision.targetLabel;
 
-    let modelsToTry = getTierModels(profile, decision.tier, preferredModel);
-    if (imageAttached) {
-      modelsToTry = modelsToTry.filter(checkModelSupportsImage);
-      if (modelsToTry.length === 0) {
-        modelsToTry = [preferredModel];
-      }
-    }
+    // One shared calculation for image compatibility, resolvability, the
+    // mandatory encrypted-reasoning exclusions, cooldown selection and retry
+    // rotation -- the same one the agent_before_settle replacement check uses
+    // (extensions/index.ts). Never re-derives candidates here.
+    const failedRef =
+      request.reason === 'retry' && request.failed?.model
+        ? `${request.failed.model.provider}/${request.failed.model.id}`
+        : undefined;
+    const selection = selectCandidates({
+      tier: decision.tier,
+      preferredModel,
+      requiresImage: imageAttached,
+      failedRef,
+    });
 
-    if (cooldownStore) {
-      modelsToTry = filterCooldownCandidates(
-        cooldownStore,
-        modelsToTry,
-        cooldownNow,
-        isUsableCandidate,
-      );
-    }
-
-    // On retry, rotate candidates so models after the failed model are attempted first.
-    if (request.reason === 'retry' && request.failed?.model) {
-      const failedRef = `${request.failed.model.provider}/${request.failed.model.id}`;
-      const failedIdx = modelsToTry.indexOf(failedRef);
-      if (failedIdx !== -1 && modelsToTry.length > 1) {
-        modelsToTry = [
-          ...modelsToTry.slice(failedIdx + 1),
-          ...modelsToTry.slice(0, failedIdx + 1),
-        ];
-      }
-    }
-
-    const resolved = resolveFirstAvailableModel(modelsToTry);
+    const resolved = resolveSelectedModel(selection, decision.tier);
     const selectedModel = resolved.model;
     if (resolved.modelRef !== decision.targetLabel || resolved.index > 0) {
       const originalTarget = decision.targetLabel;
@@ -736,14 +951,15 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
         targetModelId: resolved.modelId,
         targetLabel: resolved.modelRef,
         isFallback: true,
-        reasoning:
-          request.reason === 'retry' && request.failed
+        reasoning: encryptedReasoningExclusions.has(originalTarget)
+          ? `Fallback to ${resolved.modelRef} because ${originalTarget} rejected this conversation's replayed encrypted reasoning. (Original: ${decision.reasoning})`
+          : request.reason === 'retry' && request.failed
             ? `Fallback to ${resolved.modelRef} after ${request.failed.model.provider}/${request.failed.model.id} failed${request.failed.message.errorMessage ? ` (${request.failed.message.errorMessage})` : ''}. (Original: ${decision.reasoning})`
-            : resolved.index > 0
-              ? `Fallback to ${resolved.modelRef} because ${modelsToTry[0]} was unavailable. (Original: ${decision.reasoning})`
-              : resolved.modelRef !== originalTarget
+            : resolved.modelRef !== originalTarget
+              ? preferredModel === resolved.modelRef
                 ? `Preserved fallback ${resolved.modelRef} for ${decision.tier} tier. (Original: ${decision.reasoning})`
-                : decision.reasoning,
+                : `Fallback to ${resolved.modelRef} because ${originalTarget} was unavailable. (Original: ${decision.reasoning})`
+              : decision.reasoning,
       };
     }
 
@@ -771,6 +987,10 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
     // no matter what happens next in this route() call.
     const pendingAutoContinueNotice = state.pendingAutoContinueNotice;
     state.pendingAutoContinueNotice = undefined;
+    // Same one-shot rule for the encrypted-reasoning recovery's notice.
+    const pendingEncryptedReasoningNotice =
+      state.pendingEncryptedReasoningNotice;
+    state.pendingEncryptedReasoningNotice = undefined;
     try {
       actions.syncPiThinkingLevel(delegatedThinking);
       if (effectiveCtx) {
@@ -784,6 +1004,16 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
           actions.notify?.(
             effectiveCtx,
             `${failedRef} hit its usage limit; continuing on ${resolved.modelRef}`,
+            'info',
+          );
+        }
+      }
+      if (pendingEncryptedReasoningNotice) {
+        const { failedRef } = pendingEncryptedReasoningNotice;
+        if (effectiveCtx) {
+          actions.notify?.(
+            effectiveCtx,
+            `${failedRef} rejected this conversation's encrypted reasoning; continuing on ${resolved.modelRef}`,
             'info',
           );
         }

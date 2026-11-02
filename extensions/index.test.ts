@@ -14,6 +14,7 @@ import type {
   RouterTurnEndResult,
 } from './types';
 import routerExtension from './index';
+import { signatureFingerprint as signatureFingerprintForTest } from './encrypted-reasoning';
 
 const _extensionFactoryTypeCheck: ExtensionFactory = routerExtension;
 void _extensionFactoryTypeCheck;
@@ -76,6 +77,7 @@ const buildMockCtx = () => ({
   } as RouterModelSelectEvent['model'] | undefined,
   sessionManager: {
     getBranch: (): CustomSessionEntry[] => [],
+    getEntries: (): CustomSessionEntry[] => [],
   },
   ui: {
     setStatus: vi.fn((_key: string, _text: string | undefined) => {}),
@@ -1045,6 +1047,486 @@ describe('index.ts (orchestrator)', () => {
       );
 
       expect(mockCtx.ui.notify).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('agent_before_settle event: encrypted reasoning recovery', () => {
+    const CODEX_REJECTION =
+      '400: {"error":{"message":"Invalid \'input[3].encrypted_content\': Encrypted content could not be verified.","code":"invalid_encrypted_content"}}';
+
+    const assistantEncryptedError = (
+      overrides: Record<string, unknown> = {},
+    ) => ({
+      role: 'assistant',
+      stopReason: 'error',
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      api: 'openai-completions',
+      errorMessage: CODEX_REJECTION,
+      ...overrides,
+    });
+
+    const beforeSettleEvent = (
+      outcome: string,
+      contextMessages: RouterTestMessage[],
+    ): Partial<FullRouterEvent> => ({
+      outcome,
+      context: { contextMessages },
+    });
+
+    const triggerBeforeSettle = async (
+      event: Partial<FullRouterEvent>,
+      mockCtx: MockCtx,
+    ) => {
+      const handlers = eventListeners['agent_before_settle'] || [];
+      let result: unknown;
+      for (const handler of handlers) {
+        result = await handler(event, mockCtx);
+      }
+      return result;
+    };
+
+    const triggerSettled = async (mockCtx: MockCtx) => {
+      for (const handler of eventListeners['agent_settled'] || []) {
+        await handler({}, mockCtx);
+      }
+    };
+
+    // Seeds the persisted lastDecision on the medium tier (the tier the
+    // failed model belongs to) exactly like the auto-continue block above:
+    // the handler only knows which profile/tier to check from
+    // state.lastDecision.
+    const initRouterEnabled = async (mockCtx: MockCtx) => {
+      mockCtx.sessionManager.getBranch = () => [
+        {
+          type: 'custom',
+          customType: 'router-state',
+          data: {
+            enabled: true,
+            selectedProfile: 'balanced',
+            lastDecision: {
+              profile: 'balanced',
+              tier: 'medium',
+              phase: 'implementation',
+              targetProvider: 'openai',
+              targetModelId: 'gpt-4o-mini',
+              targetLabel: 'openai/gpt-4o-mini',
+              reasoning: 'test',
+              thinking: 'off',
+              timestamp: Date.now(),
+            },
+            timestamp: Date.now(),
+          },
+        },
+      ];
+      for (const handler of eventListeners['session_start'] || []) {
+        await handler({}, mockCtx);
+      }
+    };
+
+    // The regression: without this second recovery path the run simply ends
+    // with the rejection shown to the user, even though another configured
+    // model can answer (the semantic equivalent of switching models by hand).
+    it('requests one continuation with an encrypted-reasoning entry on a rejected replay', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const result = await triggerBeforeSettle(
+        beforeSettleEvent('error', [assistantEncryptedError()]),
+        mockCtx,
+      );
+
+      expect(result).toMatchObject({
+        continue: true,
+        entries: [
+          {
+            type: 'custom_message',
+            customType: 'router-encrypted-reasoning-recovery',
+          },
+        ],
+      });
+    });
+
+    it('never fires twice for the same failed model within one run', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const first = await triggerBeforeSettle(
+        beforeSettleEvent('error', [assistantEncryptedError()]),
+        mockCtx,
+      );
+      expect(first).toBeDefined();
+
+      const second = await triggerBeforeSettle(
+        beforeSettleEvent('error', [assistantEncryptedError()]),
+        mockCtx,
+      );
+      expect(second).toBeUndefined();
+    });
+
+    it('continues away from a second, different model that also rejects the payload', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      await triggerBeforeSettle(
+        beforeSettleEvent('error', [assistantEncryptedError()]),
+        mockCtx,
+      );
+      const result = await triggerBeforeSettle(
+        beforeSettleEvent('error', [
+          assistantEncryptedError(),
+          assistantEncryptedError({ model: 'gpt-4o' }),
+        ]),
+        mockCtx,
+      );
+
+      expect(result).toMatchObject({ continue: true });
+    });
+
+    // Exhaustion: once no other usable candidate is left, the run must end
+    // with the rejection visible instead of looping.
+    it('stays silent when no usable replacement remains', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+      mockCtx.modelRegistry.find = vi.fn(() => undefined);
+
+      const result = await triggerBeforeSettle(
+        beforeSettleEvent('error', [assistantEncryptedError()]),
+        mockCtx,
+      );
+
+      expect(result).toBeUndefined();
+    });
+
+    it('stays silent for an unrelated error and for an abort', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      expect(
+        await triggerBeforeSettle(
+          beforeSettleEvent('error', [
+            assistantEncryptedError({
+              errorMessage: '400: {"error":{"message":"Unknown parameter"}}',
+            }),
+          ]),
+          mockCtx,
+        ),
+      ).toBeUndefined();
+
+      expect(
+        await triggerBeforeSettle(
+          beforeSettleEvent('aborted', [assistantEncryptedError()]),
+          mockCtx,
+        ),
+      ).toBeUndefined();
+    });
+
+    // The usage-limit path keeps its exact behavior and its own entry type;
+    // an encrypted-reasoning failure is never limit-classified, so the two
+    // never contend for the same failure.
+    it('leaves a usage-limit failure on the auto-continue path', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const result = await triggerBeforeSettle(
+        beforeSettleEvent('error', [
+          assistantEncryptedError({ errorMessage: 'insufficient_quota' }),
+        ]),
+        mockCtx,
+      );
+
+      expect(result).toMatchObject({
+        continue: true,
+        entries: [
+          { type: 'custom_message', customType: 'router-auto-continue' },
+        ],
+      });
+    });
+
+    // P1-2 regression, extension side: the rejection is persisted as durable
+    // session metadata bound to fingerprints of the signed history, so the
+    // exclusion no longer depends on the rejecting message staying in the
+    // projection (branch summary / restart / compaction).
+    it('persists a fingerprint-bound rejection record and never the raw signature', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const signed = {
+        role: 'assistant',
+        stopReason: 'stop',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        api: 'openai-completions',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'thought',
+            thinkingSignature: 'opaque-signature-payload',
+          },
+        ],
+      };
+
+      const result = await triggerBeforeSettle(
+        beforeSettleEvent('error', [signed, assistantEncryptedError()]),
+        mockCtx,
+      );
+      expect(result).toMatchObject({ continue: true });
+
+      const appendEntryMock = mockPi.appendEntry as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      const call = appendEntryMock.mock.calls.find(
+        (args: unknown[]) => args[0] === 'router-encrypted-rejection',
+      );
+      expect(call).toBeDefined();
+      const record = call?.[1] as {
+        failedRef: string;
+        fingerprints: string[];
+      };
+      expect(record.failedRef).toBe('openai/gpt-4o-mini');
+      expect(record.fingerprints).toHaveLength(1);
+      expect(record.fingerprints[0]).toMatch(/^[0-9a-f]{16}$/);
+      expect(JSON.stringify(record)).not.toContain('opaque-signature-payload');
+    });
+
+    // P1-2 regression: metadata is loaded from ALL session entries (not only
+    // the active branch), so a branch summary that abandoned the rejecting
+    // assistant message keeps the record available; the fingerprint rule then
+    // decides whether it still applies.
+    it('loads rejection records from every session entry on session_start', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      const signed = {
+        role: 'assistant',
+        stopReason: 'stop',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        api: 'openai-completions',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'thought',
+            thinkingSignature: 'opaque-signature-payload',
+          },
+        ],
+      };
+      const fingerprint = signatureFingerprintForTest(
+        'openai',
+        'openai-completions',
+        'gpt-4o-mini',
+        'opaque-signature-payload',
+      );
+      mockCtx.sessionManager.getEntries = () => [
+        {
+          type: 'custom',
+          customType: 'router-encrypted-rejection',
+          data: {
+            customType: 'router-encrypted-rejection',
+            failedRef: 'openai/gpt-4o-mini',
+            api: 'openai-completions',
+            fingerprints: [fingerprint],
+            at: Date.now(),
+          },
+        },
+      ];
+      await initRouterEnabled(mockCtx);
+
+      // The projection still carries a rejection message, but the point of
+      // this regression is that the RECORD alone excludes the model: the only
+      // remaining candidate is the configured fallback.
+      const result = await triggerBeforeSettle(
+        beforeSettleEvent('error', [signed, assistantEncryptedError()]),
+        mockCtx,
+      );
+      expect(result).toMatchObject({ continue: true });
+    });
+
+    // P1-1 regression, decision side: the continuation check uses the same
+    // candidate calculation as route(), so it never fires when nothing is left.
+    it('does not continue when every candidate is excluded by recorded metadata', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      const signed = {
+        role: 'assistant',
+        stopReason: 'stop',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        api: 'openai-completions',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'thought',
+            thinkingSignature: 'opaque-signature-payload',
+          },
+        ],
+      };
+      const fingerprint = signatureFingerprintForTest(
+        'openai',
+        'openai-completions',
+        'gpt-4o-mini',
+        'opaque-signature-payload',
+      );
+      mockCtx.sessionManager.getEntries = () => [
+        {
+          type: 'custom',
+          customType: 'router-encrypted-rejection',
+          data: {
+            customType: 'router-encrypted-rejection',
+            failedRef: 'openai/gpt-4o-mini',
+            api: 'openai-completions',
+            fingerprints: [fingerprint],
+            at: Date.now(),
+          },
+        },
+        {
+          type: 'custom',
+          customType: 'router-encrypted-rejection',
+          data: {
+            customType: 'router-encrypted-rejection',
+            failedRef: 'openai/gpt-4o-mini-fallback',
+            api: 'openai-completions',
+            fingerprints: [fingerprint],
+            at: Date.now(),
+          },
+        },
+      ];
+      await initRouterEnabled(mockCtx);
+
+      const result = await triggerBeforeSettle(
+        beforeSettleEvent('error', [signed, assistantEncryptedError()]),
+        mockCtx,
+      );
+      expect(result).toBeUndefined();
+    });
+
+    // P1 regression: the rejection is persisted BEFORE (and independently of)
+    // the continuation decision. At final exhaustion there is no replacement,
+    // so no continuation is requested -- but this model's signature binding
+    // must still be saved, otherwise a later branch summary that keeps its
+    // signed response would make it selectable again.
+    it('persists the rejection even when no continuation is possible', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+      // No candidate resolves -> no usable replacement -> no continuation.
+      mockCtx.modelRegistry.find = vi.fn(() => undefined);
+
+      const signed = {
+        role: 'assistant',
+        stopReason: 'stop',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        api: 'openai-completions',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'thought',
+            thinkingSignature: 'opaque-signature-payload',
+          },
+        ],
+      };
+      const result = await triggerBeforeSettle(
+        beforeSettleEvent('error', [signed, assistantEncryptedError()]),
+        mockCtx,
+      );
+
+      expect(result).toBeUndefined();
+      const appendEntryMock = mockPi.appendEntry as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      const call = appendEntryMock.mock.calls.find(
+        (args: unknown[]) => args[0] === 'router-encrypted-rejection',
+      );
+      expect(call).toBeDefined();
+      const record = call?.[1] as { failedRef: string; fingerprints: string[] };
+      expect(record.failedRef).toBe('openai/gpt-4o-mini');
+      expect(record.fingerprints).toHaveLength(1);
+    });
+
+    // P1 regression (over-binding): a rejection is bound only to the rejecting
+    // model's own replayable signatures, so another model's payload staying in
+    // the conversation cannot keep it excluded.
+    it("persists only the rejecting model's own signature fingerprints", async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const foreign = {
+        role: 'assistant',
+        stopReason: 'stop',
+        provider: 'google',
+        model: 'gemini-1.5-flash',
+        api: 'openai-completions',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'thought',
+            thinkingSignature: 'foreign-signature',
+          },
+        ],
+      };
+      const own = {
+        role: 'assistant',
+        stopReason: 'stop',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        api: 'openai-completions',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'thought',
+            thinkingSignature: 'own-signature',
+          },
+        ],
+      };
+      await triggerBeforeSettle(
+        beforeSettleEvent('error', [foreign, own, assistantEncryptedError()]),
+        mockCtx,
+      );
+
+      const appendEntryMock = mockPi.appendEntry as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      const record = appendEntryMock.mock.calls.find(
+        (args: unknown[]) => args[0] === 'router-encrypted-rejection',
+      )?.[1] as { fingerprints: string[] };
+      expect(record.fingerprints).toEqual([
+        signatureFingerprintForTest(
+          'openai',
+          'openai-completions',
+          'gpt-4o-mini',
+          'own-signature',
+        ),
+      ]);
+    });
+
+    it('agent_settled ends the episode so a later run fires again', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      expect(
+        await triggerBeforeSettle(
+          beforeSettleEvent('error', [assistantEncryptedError()]),
+          mockCtx,
+        ),
+      ).toBeDefined();
+
+      await triggerSettled(mockCtx);
+
+      expect(
+        await triggerBeforeSettle(
+          beforeSettleEvent('error', [assistantEncryptedError()]),
+          mockCtx,
+        ),
+      ).toBeDefined();
     });
   });
 

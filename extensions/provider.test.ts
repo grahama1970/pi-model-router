@@ -10,6 +10,7 @@ import {
   type RouterProviderActions,
 } from './provider';
 import { createCooldownStore, type CooldownStore } from './cooldown';
+import { signatureFingerprint } from './encrypted-reasoning';
 import type { Api, AssistantMessage, Model } from '@earendil-works/pi-ai';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import type {
@@ -1697,6 +1698,510 @@ describe('provider.ts (virtual models)', () => {
 
         expect(mockActions.notify).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe('encrypted-reasoning recovery (integration)', () => {
+    const CODEX_REJECTION =
+      '400: {"error":{"message":"Invalid \'input[3].encrypted_content\': Encrypted content could not be verified.","code":"invalid_encrypted_content"}}';
+
+    // A stored assistant failure of the shape Pi persists for a rejected
+    // replayed encrypted-reasoning payload.
+    const encryptedRejection = (
+      provider: string,
+      model: string,
+      errorMessage = CODEX_REJECTION,
+    ) => ({
+      ...createAssistantMsg('', 0),
+      provider,
+      model,
+      api: 'openai-completions' as Api,
+      stopReason: 'error' as const,
+      errorMessage,
+    });
+
+    // Regression: without the conversation-scoped exclusion in route(), the
+    // continuation this conversation was given (extensions/index.ts's
+    // agent_before_settle handler) would select the very model whose error is
+    // still in the history, replaying the identical rejected payload forever.
+    it('skips the model that rejected the conversation encrypted reasoning and says why', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const route = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            encryptedRejection('openai', 'gpt-4o-mini'),
+            { role: 'user', content: 'please continue', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gemini-1.5-flash');
+      expect(mockState.lastDecision?.isFallback).toBe(true);
+      expect(mockState.lastDecision?.reasoning).toContain(
+        "openai/gpt-4o-mini rejected this conversation's replayed encrypted reasoning",
+      );
+    });
+
+    it('keeps avoiding that model on later turns in the same conversation', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const first = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            encryptedRejection('openai', 'gpt-4o-mini'),
+            { role: 'user', content: 'please continue', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(first.model.id).toBe('gemini-1.5-flash');
+
+      const second = await vm.route(
+        buildRequest({
+          reason: 'user',
+          state: first.state,
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            encryptedRejection('openai', 'gpt-4o-mini'),
+            { role: 'user', content: 'please continue', timestamp: Date.now() },
+            createAssistantMsg('done'),
+            { role: 'user', content: 'next task', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(second.model.id).toBe('gemini-1.5-flash');
+    });
+
+    // P1-1 regression: the exclusion is mandatory and is never restored on
+    // exhaustion. With every candidate rejected, route() must stop with a
+    // clear error instead of replaying a rejected model.
+    it('stops with a clear error when every candidate in the tier was excluded', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      await expect(
+        vm.route(
+          buildRequest({
+            messages: [
+              { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+              encryptedRejection('openai', 'gpt-4o-mini'),
+              encryptedRejection('google', 'gemini-1.5-flash'),
+              {
+                role: 'user',
+                content: 'please continue',
+                timestamp: Date.now(),
+              },
+            ],
+          }),
+          mockState.lastExtensionContext!,
+        ),
+      ).rejects.toThrow(
+        /stopping instead of replaying rejected encrypted reasoning.*openai\/gpt-4o-mini.*google\/gemini-1.5-flash/,
+      );
+    });
+
+    // P1-1 regression: exclusion must be applied BEFORE cooldown selection, and
+    // the cooldown store's "keep the soonest-expiring usable model" fallback
+    // must never bring an excluded model back.
+    it('never lets a cooldown fallback resurrect the excluded model', async () => {
+      const cooldownDir = mkdtempSync(join(tmpdir(), 'pmr-excl-cooldown-'));
+      Object.assign(mockState, {
+        cooldownStore: createCooldownStore(
+          join(cooldownDir, 'cooldowns'),
+          () => Date.now(),
+          join(cooldownDir, 'provider-switch.json'),
+        ),
+      });
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      const now = Date.now();
+      mockState.cooldownStore!.record(
+        'openai/gpt-4o-mini',
+        'retry in 5 min',
+        'retry',
+        mockState.currentConfig,
+        now,
+      );
+      mockState.cooldownStore!.record(
+        'google/gemini-1.5-flash',
+        'retry in 10 min',
+        'retry',
+        mockState.currentConfig,
+        now,
+      );
+
+      const route = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: now },
+            encryptedRejection('openai', 'gpt-4o-mini'),
+            { role: 'user', content: 'please continue', timestamp: now },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gemini-1.5-flash');
+      expect(mockState.lastDecision?.targetLabel).toBe(
+        'google/gemini-1.5-flash',
+      );
+      rmSync(cooldownDir, { recursive: true, force: true });
+    });
+
+    // P1 regression: a FRESH request.failed rejection must be honored even when
+    // the model already has an older record bound to a different payload.
+    it('honors request.failed for a model with an older, retired record', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      Object.assign(mockState, {
+        encryptedRejections: [
+          {
+            customType: 'router-encrypted-rejection',
+            failedRef: 'openai/gpt-4o-mini',
+            api: 'openai-completions',
+            // Bound to a payload that is NO LONGER in the conversation.
+            fingerprints: [
+              signatureFingerprint(
+                'openai',
+                'openai-completions',
+                'gpt-4o-mini',
+                'old-gone-signature',
+              ),
+            ],
+            at: Date.now(),
+          },
+        ],
+      });
+      mockState.lastDecision = {
+        profile: 'balanced',
+        tier: 'medium',
+        phase: 'implementation',
+        targetProvider: 'openai',
+        targetModelId: 'gpt-4o-mini',
+        targetLabel: 'openai/gpt-4o-mini',
+        thinking: 'medium',
+        reasoning: 'Initial decision',
+        timestamp: Date.now(),
+      };
+
+      const route = await vm.route(
+        buildRequest({
+          reason: 'retry',
+          state: {
+            phase: 'implementation',
+            tier: 'medium',
+            lastDecision: mockState.lastDecision,
+          },
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            {
+              ...createAssistantMsg(''),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              content: [
+                {
+                  type: 'thinking',
+                  thinking: 'thought',
+                  thinkingSignature: 'new-payload-signature',
+                },
+              ],
+            },
+          ],
+          failed: {
+            model: createTestModel({ provider: 'openai', id: 'gpt-4o-mini' }),
+            thinkingLevel: 'medium',
+            message: {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: CODEX_REJECTION,
+            },
+          },
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gemini-1.5-flash');
+    });
+
+    // P1-2 regression: a retryable wrapper around the same rejection reaches
+    // routing as `request.failed` and need not be in the projection at all.
+    it('excludes the model from request.failed when no rejection is projected', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      mockActions.recordEncryptedRejection = vi.fn();
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      mockState.lastDecision = {
+        profile: 'balanced',
+        tier: 'medium',
+        phase: 'implementation',
+        targetProvider: 'openai',
+        targetModelId: 'gpt-4o-mini',
+        targetLabel: 'openai/gpt-4o-mini',
+        thinking: 'medium',
+        reasoning: 'Initial decision',
+        timestamp: Date.now(),
+      };
+
+      const route = await vm.route(
+        buildRequest({
+          reason: 'retry',
+          state: {
+            phase: 'implementation',
+            tier: 'medium',
+            lastDecision: mockState.lastDecision,
+          },
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            {
+              ...createAssistantMsg(''),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              content: [
+                {
+                  type: 'thinking',
+                  thinking: 'thought',
+                  thinkingSignature: 'opaque-signature-payload',
+                },
+              ],
+            },
+          ],
+          failed: {
+            model: createTestModel({ provider: 'openai', id: 'gpt-4o-mini' }),
+            thinkingLevel: 'medium',
+            message: {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: `500 service unavailable: ${CODEX_REJECTION}`,
+            },
+          },
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gemini-1.5-flash');
+      expect(mockActions.recordEncryptedRejection).toHaveBeenCalledTimes(1);
+      const record = (
+        mockActions.recordEncryptedRejection as ReturnType<typeof vi.fn>
+      ).mock.calls[0][0] as { failedRef: string; fingerprints: string[] };
+      expect(record.failedRef).toBe('openai/gpt-4o-mini');
+      expect(record.fingerprints).toHaveLength(1);
+    });
+
+    // Branch-summary shape: the signed response is still in the projection but
+    // the rejecting error is not. Only durable, fingerprint-bound metadata can
+    // exclude the model here.
+    it('excludes from durable metadata when the rejection message is not projected', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      const signed = {
+        role: 'assistant' as const,
+        api: 'openai-completions' as Api,
+        content: [
+          {
+            type: 'thinking' as const,
+            thinking: 'thought',
+            thinkingSignature: 'opaque-signature-payload',
+          },
+        ],
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        usage: createAssistantMsg('').usage,
+        stopReason: 'stop' as const,
+        timestamp: Date.now(),
+      };
+      Object.assign(mockState, {
+        encryptedRejections: [
+          {
+            customType: 'router-encrypted-rejection',
+            failedRef: 'openai/gpt-4o-mini',
+            api: 'openai-completions',
+            fingerprints: [
+              signatureFingerprint(
+                'openai',
+                'openai-completions',
+                'gpt-4o-mini',
+                'opaque-signature-payload',
+              ),
+            ],
+            at: Date.now(),
+          },
+        ],
+      });
+
+      const route = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            signed,
+            { role: 'user', content: 'please continue', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gemini-1.5-flash');
+      expect(mockState.lastDecision?.reasoning).toContain(
+        "openai/gpt-4o-mini rejected this conversation's replayed encrypted reasoning",
+      );
+    });
+
+    // The other side of the same rule: once the implicated signed history is
+    // gone, the record retires and the model is selectable again.
+    it('retires a durable record when the implicated signed history is gone', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      Object.assign(mockState, {
+        encryptedRejections: [
+          {
+            customType: 'router-encrypted-rejection',
+            failedRef: 'openai/gpt-4o-mini',
+            api: 'openai-completions',
+            fingerprints: [
+              signatureFingerprint(
+                'openai',
+                'openai-completions',
+                'gpt-4o-mini',
+                'gone-signature',
+              ),
+            ],
+            at: Date.now(),
+          },
+        ],
+      });
+
+      const route = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            { role: 'user', content: 'please continue', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gpt-4o-mini');
+    });
+
+    // Image compatibility must still win: with an image in the conversation,
+    // an excluded image-capable model is replaced by another image-capable
+    // model, never by a text-only one.
+    it('keeps the image requirement when excluding a model', async () => {
+      const textOnly = createTestModel({
+        provider: 'textonly',
+        id: 'text-only',
+        input: ['text'],
+      });
+      const registry: RouterModelRegistry = {
+        find: (provider: string, modelId: string) =>
+          provider === 'textonly'
+            ? textOnly
+            : createTestModel({
+                provider,
+                id: modelId,
+                input: ['text', 'image'],
+              }),
+        hasConfiguredAuth: () => true,
+      };
+      mockState.currentModelRegistry = registry;
+      mockState.lastExtensionContext = { modelRegistry: registry };
+      mockState.currentConfig = {
+        profiles: {
+          balanced: {
+            medium: {
+              model: 'openai/gpt-4o-mini',
+              fallbacks: [
+                { model: 'textonly/text-only' },
+                { model: 'google/gemini-1.5-flash' },
+              ],
+            },
+          },
+        },
+      };
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const route = await vm.route(
+        buildRequest({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'image', data: 'AAA', mimeType: 'image/png' },
+                { type: 'text', text: 'fix this bug' },
+              ],
+              timestamp: Date.now(),
+            },
+            encryptedRejection('openai', 'gpt-4o-mini'),
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gemini-1.5-flash');
+      expect(route.model.input).toContain('image');
+    });
+
+    it('leaves a usage-limit failure on the auto-continue path', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+
+      const route = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            encryptedRejection('openai', 'gpt-4o-mini', 'insufficient_quota'),
+            { role: 'user', content: 'please continue', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(route.model.id).toBe('gpt-4o-mini');
+      expect(mockState.lastDecision?.reasoning).not.toContain('encrypted');
+    });
+
+    it('fires exactly one notice naming the rejected model and the replacement', async () => {
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      mockState.pendingEncryptedReasoningNotice = {
+        failedRef: 'openai/gpt-4o-mini',
+      };
+
+      const messages = [
+        { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+        encryptedRejection('openai', 'gpt-4o-mini'),
+        { role: 'user', content: 'please continue', timestamp: Date.now() },
+      ] as ModelRouteRequest<VirtualRouterState>['messages'];
+
+      await vm.route(
+        buildRequest({ messages }),
+        mockState.lastExtensionContext!,
+      );
+
+      expect(mockActions.notify).toHaveBeenCalledTimes(1);
+      expect(mockActions.notify).toHaveBeenCalledWith(
+        mockState.lastExtensionContext,
+        "openai/gpt-4o-mini rejected this conversation's encrypted reasoning; continuing on google/gemini-1.5-flash",
+        'info',
+      );
+      expect(mockState.pendingEncryptedReasoningNotice).toBeUndefined();
+
+      await vm.route(
+        buildRequest({ messages }),
+        mockState.lastExtensionContext!,
+      );
+      expect(mockActions.notify).toHaveBeenCalledTimes(1);
     });
   });
 
