@@ -34,6 +34,8 @@ import {
   getTierModels,
 } from './provider';
 import { createCooldownStore } from './cooldown';
+import { loadAccountRegistry, registerPersistedAccounts } from './accounts';
+import type { AccountRegistry } from './accounts';
 import {
   createAutoContinueGuardState,
   evaluateBeforeSettleForAutoContinue,
@@ -62,6 +64,14 @@ const routerExtension = <
     lastNonRouterModel: undefined as string | undefined,
     accumulatedCost: 0,
     cooldownStore: createCooldownStore(),
+    accountRegistry: loadAccountRegistry() as AccountRegistry,
+    // Provider ids this process itself registered via accounts.ts's
+    // registerAccountProvider/registerPersistedAccounts -- never persisted
+    // (pi.registerProvider() is runtime-only). Used to refuse overwriting a
+    // provider id this feature does not own, and to refuse unregistering one
+    // it never actually registered (extensions/accounts.ts's
+    // registerAccountProvider/unregisterAccountProvider).
+    ownedAccountProviderIds: new Set<string>(),
     processStartTime: Date.now(),
     processedTranscriptFailures: new Set<string>(),
     // In-memory only, never persisted "never chain" / "at most once per
@@ -274,6 +284,14 @@ const routerExtension = <
     registerRouterProvider: () => {
       registerRouterProvider(pi, state, actions);
     },
+    reregisterAccounts: (ctx: TCtx) => {
+      registerPersistedAccounts(
+        state.accountRegistry,
+        ctx.modelRegistry,
+        pi,
+        state.ownedAccountProviderIds,
+      );
+    },
   };
 
   actions.reloadConfig();
@@ -283,6 +301,13 @@ const routerExtension = <
     state.currentModelRegistry = ctx.modelRegistry;
     state.currentCwd = ctx.cwd;
     actions.reloadConfig(ctx);
+    // Re-read the registry (another process may have added an account since
+    // this one started) and re-register every clone: pi.registerProvider()
+    // is a runtime call, never persisted by Pi itself, so a fresh process
+    // must redo it on every session_start, same as the router's own virtual
+    // models via actions.registerRouterProvider() above.
+    state.accountRegistry = loadAccountRegistry();
+    actions.reregisterAccounts(ctx);
 
     state.routerEnabled = ctx.model?.provider === 'router';
     state.selectedProfile =
@@ -409,6 +434,8 @@ const routerExtension = <
       state.lastExtensionContext = ctx;
       state.currentCwd = ctx.cwd;
       actions.reloadConfig(ctx);
+      state.accountRegistry = loadAccountRegistry();
+      actions.reregisterAccounts(ctx);
     }
   };
 

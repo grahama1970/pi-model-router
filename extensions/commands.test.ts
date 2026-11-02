@@ -1,11 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Api, Model } from '@earendil-works/pi-ai';
+import type { Api, Model, Provider } from '@earendil-works/pi-ai';
 import type { AutocompleteItem } from '@earendil-works/pi-tui';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { registerCommands } from './commands';
 import { createCooldownStore } from './cooldown';
+import {
+  claimNextAccountSlot,
+  loadAccountRegistry,
+  markAccountRemoved,
+  readAccountEntry,
+} from './accounts';
 import type {
   RouterConfig,
   RoutingDecision,
@@ -36,6 +43,31 @@ const createTestModel = (provider: string, id: string): Model<Api> => ({
 });
 
 describe('commands.ts', () => {
+  // extensions/accounts.ts's claimNextAccountSlot/loadAccountRegistry/
+  // markAccountRemoved/readAccountEntry all read the account-alias
+  // directory via `PI_MODEL_ROUTER_ACCOUNTS`, resolved lazily at call time
+  // (same pattern as cooldown.ts's `PI_MODEL_ROUTER_COOLDOWNS`, see
+  // index.test.ts). Every test in this file gets its own tmp directory so
+  // none of them ever touch the real ~/.local/state/pi-model-router/accounts.
+  let accountsDir: string;
+  let previousAccountsEnv: string | undefined;
+
+  beforeEach(() => {
+    previousAccountsEnv = process.env.PI_MODEL_ROUTER_ACCOUNTS;
+    accountsDir = mkdtempSync(join(tmpdir(), 'pmr-commands-accounts-'));
+    process.env.PI_MODEL_ROUTER_ACCOUNTS = accountsDir;
+  });
+
+  afterEach(() => {
+    if (previousAccountsEnv === undefined) {
+      delete process.env.PI_MODEL_ROUTER_ACCOUNTS;
+    } else {
+      process.env.PI_MODEL_ROUTER_ACCOUNTS = previousAccountsEnv;
+    }
+    chmodSync(accountsDir, 0o700); // undo any permission-failure test's chmod
+    rmSync(accountsDir, { recursive: true, force: true });
+  });
+
   const buildMockPi = () => {
     let registeredCommand: RegisteredRouterCommand | null = null;
     return {
@@ -47,6 +79,9 @@ describe('commands.ts', () => {
       setModel: vi
         .fn<(model: Model<Api>) => Promise<boolean>>()
         .mockResolvedValue(true),
+      registerProvider: vi.fn() as unknown as ExtensionAPI['registerProvider'],
+      unregisterProvider:
+        vi.fn() as unknown as ExtensionAPI['unregisterProvider'],
       getRegisteredCommand: () => {
         if (!registeredCommand || !registeredCommand.getArgumentCompletions) {
           throw new Error('Command router was not registered');
@@ -80,6 +115,20 @@ describe('commands.ts', () => {
           }
           return undefined;
         }),
+      getProvider: vi
+        .fn<(id: string) => Provider | undefined>()
+        .mockImplementation((id: string) =>
+          id === 'zai' || id === 'anthropic'
+            ? ({
+                id,
+                name: id === 'zai' ? 'ZAI' : 'Anthropic',
+                getModels: () => [],
+                stream: vi.fn(),
+                streamSimple: vi.fn(),
+                auth: { apiKey: undefined, oauth: undefined },
+              } as unknown as Provider)
+            : undefined,
+        ),
     },
     model: { provider: 'router', id: 'balanced' },
   });
@@ -123,6 +172,7 @@ describe('commands.ts', () => {
       widgetEnabled: false,
       debugHistory: [lastDecision],
       lastConfigWarnings: [] as string[],
+      ownedAccountProviderIds: new Set<string>(),
     };
   };
 
@@ -1203,7 +1253,432 @@ describe('commands.ts', () => {
     });
   });
 
+  describe('handleAccount', () => {
+    // These tests exercise the real filesystem persistence layer
+    // (extensions/accounts.ts), not a mocked registry: handleAccount's
+    // add/list/remove now read/write per-account files directly under
+    // accountsDir (see the outer beforeEach above) rather than mutating an
+    // in-memory "registry" object that a separate save action persists.
+
+    it('registers an account clone by claiming zai-2 on disk', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account add zai', ctx);
+
+      expect(pi.registerProvider).toHaveBeenCalledTimes(1);
+      const registered = (pi.registerProvider as ReturnType<typeof vi.fn>).mock
+        .calls[0][0] as Provider;
+      expect(registered.id).toBe('zai-2');
+      expect(registered.name).toContain('account 2');
+      expect(loadAccountRegistry(accountsDir).accounts.zai).toEqual([2]);
+      expect(readAccountEntry('zai-2', accountsDir)?.removed).toBe(false);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining('Registered account "zai-2"'),
+        'info',
+      );
+    });
+
+    it('assigns increasing account numbers across repeated adds for the same base', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account add zai', ctx);
+      await cmd.handler('account add zai', ctx);
+
+      expect(loadAccountRegistry(accountsDir).accounts.zai).toEqual([2, 3]);
+      const ids = (
+        pi.registerProvider as ReturnType<typeof vi.fn>
+      ).mock.calls.map((call) => (call[0] as Provider).id);
+      expect(ids).toEqual(['zai-2', 'zai-3']);
+    });
+
+    it('rejects anthropic with a clear message and registers/claims nothing', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account add anthropic', ctx);
+
+      expect(pi.registerProvider).not.toHaveBeenCalled();
+      expect(
+        loadAccountRegistry(accountsDir).accounts.anthropic,
+      ).toBeUndefined();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining('Pi Black'),
+        'error',
+      );
+    });
+
+    it('rejects an unknown base provider', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account add not-a-real-provider', ctx);
+
+      expect(pi.registerProvider).not.toHaveBeenCalled();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining('Unknown provider'),
+        'error',
+      );
+    });
+
+    it('shows usage error for add with no provider argument', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account add', ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'Usage: /router account add <provider>',
+        'error',
+      );
+    });
+
+    it('P1 regression: rolls back (tombstones the already-claimed slot, never deletes it) when provider registration fails on add', async () => {
+      // Order is claim-then-register (the slot's file is persisted, atomically,
+      // BEFORE pi.registerProvider is ever called) -- so a registration
+      // failure can never leave a provider registered with nothing on disk
+      // claiming its slot. It can leave a claimed-but-never-registered file,
+      // which must be tombstoned (not deleted) so the number is never reused.
+      // This is the "add-save-failure rollback" case flagged as missing by the
+      // review: the old design's failure mode was a save() call failing after
+      // registration; here the equivalent failure is registration itself
+      // failing after the (always-persisted-on-success) claim.
+      const pi = buildMockPi();
+      pi.registerProvider = vi.fn().mockImplementation(() => {
+        throw new Error('registerProvider boom');
+      }) as unknown as ExtensionAPI['registerProvider'];
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account add zai', ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to register account "zai-2"'),
+        'error',
+      );
+      const entry = readAccountEntry('zai-2', accountsDir);
+      expect(entry).toBeDefined();
+      expect(entry?.removed).toBe(true); // tombstoned, not deleted
+      expect(loadAccountRegistry(accountsDir).accounts.zai).toBeUndefined(); // not active
+      expect(state.ownedAccountProviderIds.has('zai-2')).toBe(false);
+    });
+
+    it('reports an error and never calls pi.registerProvider when claiming an account slot fails', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      chmodSync(accountsDir, 0o500); // directory not writable -> claim fails
+      await cmd.handler('account add zai', ctx);
+      chmodSync(accountsDir, 0o700);
+
+      expect(pi.registerProvider).not.toHaveBeenCalled();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to register account for "zai"'),
+        'error',
+      );
+    });
+
+    it('lists registered accounts grouped by base', async () => {
+      claimNextAccountSlot('zai', accountsDir); // zai-2
+      claimNextAccountSlot('zai', accountsDir); // zai-3
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account list', ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining('zai: zai-2, zai-3'),
+        'info',
+      );
+    });
+
+    it('reports no accounts when none are registered', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account list', ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'No extra accounts registered.',
+        'info',
+      );
+    });
+
+    it('account list always re-scans the directory fresh (never a cached view)', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account list', ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'No extra accounts registered.',
+        'info',
+      );
+
+      // Simulates a DIFFERENT process adding an account for the same base
+      // directly on disk, with no in-memory state in common with this `state`.
+      claimNextAccountSlot('zai', accountsDir);
+
+      await cmd.handler('account list', ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining('zai: zai-2'),
+        'info',
+      );
+    });
+
+    it('removes a registered account, unregisters the provider, and tombstones its file', async () => {
+      claimNextAccountSlot('zai', accountsDir); // zai-2
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      // Ownership of "zai-2" is normally established by registerPersistedAccounts
+      // on session_start/turn_start before any command can run (see
+      // extensions/index.ts's restoreStateFromSession/ensureInitializedFromContext).
+      state.ownedAccountProviderIds.add('zai-2');
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account remove zai-2', ctx);
+
+      expect(pi.unregisterProvider).toHaveBeenCalledWith('zai-2');
+      expect(loadAccountRegistry(accountsDir).accounts.zai).toBeUndefined();
+      const entry = readAccountEntry('zai-2', accountsDir);
+      expect(entry?.removed).toBe(true);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'Removed account "zai-2".',
+        'info',
+      );
+    });
+
+    it("tombstones the file even when this process never actually registered the provider (not owned -- never unregisters someone else's id)", async () => {
+      claimNextAccountSlot('zai', accountsDir); // zai-2
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      // state.ownedAccountProviderIds deliberately left empty.
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account remove zai-2', ctx);
+
+      expect(pi.unregisterProvider).not.toHaveBeenCalled();
+      expect(loadAccountRegistry(accountsDir).accounts.zai).toBeUndefined();
+      expect(readAccountEntry('zai-2', accountsDir)?.removed).toBe(true);
+    });
+
+    it("P1 regression: removing one session's account never erases a different base's accounts that only exist on disk", async () => {
+      // Simulates a second, independent session's account that this `state`
+      // never knew about (no shared in-memory registry) -- it must survive an
+      // unrelated remove untouched.
+      claimNextAccountSlot('zai', accountsDir); // zai-2, about to be removed
+      claimNextAccountSlot('deepseek', accountsDir); // deepseek-2, a different session's account
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      state.ownedAccountProviderIds.add('zai-2');
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account remove zai-2', ctx);
+
+      expect(loadAccountRegistry(accountsDir).accounts.zai).toBeUndefined();
+      expect(loadAccountRegistry(accountsDir).accounts.deepseek).toEqual([2]);
+    });
+
+    it('rolls back (re-registers the clone) when persisting the removal fails', async () => {
+      claimNextAccountSlot('zai', accountsDir); // zai-2
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      state.ownedAccountProviderIds.add('zai-2');
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      chmodSync(accountsDir, 0o500); // directory not writable -> the tombstone rewrite fails
+      await cmd.handler('account remove zai-2', ctx);
+      chmodSync(accountsDir, 0o700);
+
+      expect(pi.unregisterProvider).toHaveBeenCalledWith('zai-2');
+      // The on-disk file is unchanged (rewrite failed) -- still active.
+      expect(readAccountEntry('zai-2', accountsDir)?.removed).toBe(false);
+      // ...and the clone is re-registered under the same alias id.
+      const registerCalls = (
+        pi.registerProvider as ReturnType<typeof vi.fn>
+      ).mock.calls.map((call) => (call[0] as Provider).id);
+      expect(registerCalls).toContain('zai-2');
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining('rolled back'),
+        'error',
+      );
+    });
+
+    it('reports an error when removing an unknown account', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account remove zai-9', ctx);
+
+      expect(pi.unregisterProvider).not.toHaveBeenCalled();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'No such account: zai-9',
+        'error',
+      );
+    });
+
+    it('reports an error when removing an already-removed (tombstoned) account', async () => {
+      const claim = claimNextAccountSlot('zai', accountsDir);
+      markAccountRemoved(claim.aliasId!, accountsDir);
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account remove zai-2', ctx);
+
+      expect(pi.unregisterProvider).not.toHaveBeenCalled();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'No such account: zai-2',
+        'error',
+      );
+    });
+
+    it('shows usage error for an unknown account action', async () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+      const ctx = buildMockCtx();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      await cmd.handler('account', ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        'Usage: /router account <add <provider>|list|remove <alias>>',
+        'error',
+      );
+    });
+  });
+
   describe('Autocomplete completions', () => {
+    it('should autocomplete the account subcommand name', () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      const completions = cmd.getArgumentCompletions('');
+      const names = completions!.map((c) => c.value);
+      expect(names).toContain('account');
+    });
+
+    it('should autocomplete account actions', () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      const completions = cmd.getArgumentCompletions('account ');
+      expect(completions).toBeDefined();
+      const values = completions!.map((c) => c.value);
+      expect(values).toEqual(['account add', 'account list', 'account remove']);
+    });
+
+    it('should autocomplete known aliases for account remove', () => {
+      claimNextAccountSlot('zai', accountsDir); // zai-2
+      claimNextAccountSlot('zai', accountsDir); // zai-3
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      const completions = cmd.getArgumentCompletions('account remove ');
+      expect(completions).toBeDefined();
+      const values = completions!.map((c) => c.value);
+      expect(values).toEqual(['account remove zai-2', 'account remove zai-3']);
+    });
+
+    it('should return null for account add (no provider completions offered)', () => {
+      const pi = buildMockPi();
+      const state = buildDefaultState();
+      const actions = buildMockActions();
+
+      registerCommands(pi, state, actions);
+      const cmd = pi.getRegisteredCommand();
+
+      expect(cmd.getArgumentCompletions('account add ')).toBeNull();
+    });
+
     it('should return thinking completions for first arg', () => {
       const pi = buildMockPi();
       const state = buildDefaultState();

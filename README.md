@@ -147,26 +147,33 @@ Then reference `"llama-local/qwen3-coder"` in your `model-router.json` tiers or 
 
 ## Commands
 
-| Command                             | Description                                                                                                       |
-| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `/router`                           | Show detailed status, current profile, spend, and settings.                                                       |
-| `/router status`                    | Alias for `/router` (show current status).                                                                        |
-| `/router profile [name]`            | Switch to a profile or list available ones (enables router if off).                                               |
-| `/router pin <t\|a>`                | Pin a tier (high/medium/low/auto) for the active profile.                                                         |
-| `/router fix <tier>`                | Correct the _last_ decision and pin that tier for the current profile.                                            |
-| `/router thinking <level>`          | Override thinking level for all tiers (e.g. `/router thinking max`). Not all tier models may support every level. |
-| `/router thinking <tier> <level>`   | Override thinking level for a specific tier (e.g. `/router thinking low off`).                                    |
-| `/router disable`                   | Disable the router and switch back to the last non-router model.                                                  |
-| `/router widget <on\|off>`          | Toggle the persistent state widget (supports `toggle`).                                                           |
-| `/router debug <on\|off>`           | Toggle turn-by-turn routing notifications (supports `toggle`, `clear`, `show`).                                   |
-| `/router cooldowns`                 | Show cooldowns merged across Pi sessions, including local and UTC reset times.                                    |
-| `/router cooldown clear <ref\|all>` | Clear one cooldown (`provider/model`) or all cooldowns for this session.                                          |
-| `/router reload`                    | Hot-reload the configuration JSON.                                                                                |
-| `/router help`                      | Show usage help for all subcommands.                                                                              |
+| Command                             | Description                                                                                                            |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `/router`                           | Show detailed status, current profile, spend, and settings.                                                            |
+| `/router status`                    | Alias for `/router` (show current status).                                                                             |
+| `/router profile [name]`            | Switch to a profile or list available ones (enables router if off).                                                    |
+| `/router pin <t\|a>`                | Pin a tier (high/medium/low/auto) for the active profile.                                                              |
+| `/router fix <tier>`                | Correct the _last_ decision and pin that tier for the current profile.                                                 |
+| `/router thinking <level>`          | Override thinking level for all tiers (e.g. `/router thinking max`). Not all tier models may support every level.      |
+| `/router thinking <tier> <level>`   | Override thinking level for a specific tier (e.g. `/router thinking low off`).                                         |
+| `/router disable`                   | Disable the router and switch back to the last non-router model.                                                       |
+| `/router widget <on\|off>`          | Toggle the persistent state widget (supports `toggle`).                                                                |
+| `/router debug <on\|off>`           | Toggle turn-by-turn routing notifications (supports `toggle`, `clear`, `show`).                                        |
+| `/router cooldowns`                 | Show cooldowns merged across Pi sessions, including local and UTC reset times.                                         |
+| `/router cooldown clear <ref\|all>` | Clear one cooldown (`provider/model`) or all cooldowns for this session.                                               |
+| `/router account add <provider>`    | Register an extra account (`<provider>-N`) cloned from an already-registered provider. Run `/login <provider>-N` next. |
+| `/router account list`              | List registered extra accounts.                                                                                        |
+| `/router account remove <alias>`    | Remove an extra account.                                                                                               |
+| `/router reload`                    | Hot-reload the configuration JSON.                                                                                     |
+| `/router help`                      | Show usage help for all subcommands.                                                                                   |
 
 ## Shared cooldowns
 
 Rate-limit cooldowns are advisory and best-effort: a provider limit error is never allowed to make a session unresponsive. Each Pi process writes its own cooldown file under `~/.local/state/pi-model-router/cooldowns/` (override the directory with `PI_MODEL_ROUTER_COOLDOWNS`), and every session merges all sessions' files to decide which models are cooling down - no locks, no cross-session coordination required. Reset timestamps without a timezone use provider defaults; configure `providerTimezones` when needed. Use `/router cooldowns` to inspect merged state and `/router cooldown clear all` to clear it for this session.
+
+## Accounts (multiple credentials per provider)
+
+Pi stores one credential per provider id in `auth.json`. `/router account add <provider>` registers `<provider>-N` as a clone of the already-registered `<provider>`'s native registration -- same API, base URL, and model catalog, same OAuth login/refresh -- under a new provider id with its own `apiKey` auth, so `/login <provider>-N` stores its credential independently and `<provider>-N` is never silently authenticated through `<provider>`'s env var or configured key when it has no credential of its own (an unconfigured account is treated as logged out: `/router account list` shows it as "not logged in", and routing skips it). Only providers with a static model catalog and no credential-dependent refresh can be added: `zai`, `openai-codex`, `deepseek`, `moonshotai`, `kimi-coding`; `/router account add <other>` is refused with an explanation. Reference the new account directly in a profile's `model` or `fallbacks`, e.g. `"model": "zai-2/glm-5.3"`. Cooldowns key on the literal `provider/model` string, so `zai/glm-5.3` cooling down never affects `zai-2/glm-5.3` -- no separate configuration needed for that. Each account gets its own file under `~/.local/state/pi-model-router/accounts/` (override with `PI_MODEL_ROUTER_ACCOUNTS`, same pattern as cooldowns) holding only its base provider id and account number, never a credential; `/router account add` claims the next free number by atomically creating that file (no shared registry to race two processes against each other), `/router account remove` tombstones -- never deletes -- its own file, and every process re-applies every active account on every session start. Account numbers are never reused after `/router account remove`, even for a removed account's own old number, and one session adding or removing an account can never erase another session's accounts for the same or a different base. `anthropic` is rejected: a second Claude-subscription account needs [Pi Black](https://github.com/paoloanzn/pi-black)'s request transform, which only patches the built-in `anthropic` provider and has no published, stable extension point this router can safely reuse. The idea of registering one extra provider per account is adapted from [hjanuschka/pi-multi-pass](https://github.com/hjanuschka/pi-multi-pass) (MIT license); this router clones whatever native provider Pi already registered for the base id instead of hand-writing provider templates, which is what extends the same mechanism to `zai` and `deepseek` as well as `openai-codex`. See `docs/ARCHITECTURE.md` for the full design and the live verification against a local fake provider.
 
 ## Documentation
 

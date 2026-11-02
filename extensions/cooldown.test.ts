@@ -642,6 +642,60 @@ describe('cooldown.ts', () => {
       });
     });
 
+    describe('accounts: an alias provider id (e.g. "zai-2") cools down independently of its base', () => {
+      // extensions/accounts.ts registers an extra account as a provider id
+      // "<base>-<n>" with its own entry in Pi's credential store. Cooldown
+      // keys here are always the literal "provider/model" string built from
+      // whichever provider id actually routed the request (see
+      // extensions/provider.ts), so no change to this file was needed for
+      // accounts to cool down independently -- these regressions pin that
+      // down.
+      it('cooling the base provider does not cool its account alias', () => {
+        const now = Date.parse('2026-11-01T00:00:00Z');
+        const store = makeStore(() => now);
+        store.record('zai/glm-5.3', '429 rate limit', 'retry', baseConfig, now);
+        expect(store.candidates(['zai/glm-5.3', 'zai-2/glm-5.3'], now)).toEqual(
+          ['zai-2/glm-5.3'],
+        );
+      });
+
+      it('cooling one account alias does not cool a sibling account alias', () => {
+        const now = Date.parse('2026-11-01T00:00:00Z');
+        const store = makeStore(() => now);
+        store.record(
+          'zai-2/glm-5.3',
+          '429 rate limit',
+          'retry',
+          baseConfig,
+          now,
+        );
+        expect(
+          store.candidates(
+            ['zai-2/glm-5.3', 'zai-3/glm-5.3', 'zai/glm-5.3'],
+            now,
+          ),
+        ).toEqual(['zai-3/glm-5.3', 'zai/glm-5.3']);
+      });
+
+      it('cools independently even for a base id that itself contains a hyphen', () => {
+        const now = Date.parse('2026-11-01T00:00:00Z');
+        const store = makeStore(() => now);
+        store.record(
+          'openai-codex/gpt-6-astra',
+          '429 rate limit',
+          'retry',
+          baseConfig,
+          now,
+        );
+        expect(
+          store.candidates(
+            ['openai-codex/gpt-6-astra', 'openai-codex-2/gpt-6-astra'],
+            now,
+          ),
+        ).toEqual(['openai-codex-2/gpt-6-astra']);
+      });
+    });
+
     describe('explicit regressions for review 2 (no locks, no leases, no spinning)', () => {
       it('an unwritable directory never throws; record() still returns a usable entry and candidates() stays fast', () => {
         const blockerFile = join(dir, 'blocker');

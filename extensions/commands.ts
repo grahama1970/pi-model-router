@@ -14,6 +14,19 @@ import type {
 } from './types';
 import type { CooldownStore } from './cooldown';
 import {
+  ACCOUNT_BASE_ALLOWLIST,
+  ACCOUNT_BASE_DENYLIST,
+  claimNextAccountSlot,
+  cloneProviderAsAccount,
+  listAliasesForBase,
+  loadAccountRegistry,
+  markAccountRemoved,
+  parseAliasId,
+  readAccountEntry,
+  registerAccountProvider,
+  unregisterAccountProvider,
+} from './accounts';
+import {
   profileNames,
   THINKING_LEVELS,
   ROUTER_PIN_VALUES,
@@ -48,6 +61,8 @@ export const registerCommands = <
       },
     ) => void;
     setModel: ExtensionAPI['setModel'];
+    registerProvider?: ExtensionAPI['registerProvider'];
+    unregisterProvider?: ExtensionAPI['unregisterProvider'];
   },
   state: {
     readonly currentConfig: RouterConfig;
@@ -63,6 +78,10 @@ export const registerCommands = <
     readonly debugHistory: RoutingDecision[];
     readonly lastConfigWarnings: string[];
     readonly cooldownStore?: CooldownStore;
+    // Provider ids this process has itself registered for the account-alias
+    // feature (see extensions/accounts.ts's registerAccountProvider /
+    // unregisterAccountProvider). Never persisted.
+    readonly ownedAccountProviderIds: Set<string>;
   },
   actions: {
     persistState: () => void;
@@ -83,6 +102,10 @@ export const registerCommands = <
     { name: 'pin', desc: 'Pin routing for a profile to a specific tier' },
     { name: 'thinking', desc: 'Override thinking level for a tier or profile' },
     { name: 'disable', desc: 'Disable the router and restore last model' },
+    {
+      name: 'account',
+      desc: 'Manage extra provider accounts (add|list|remove)',
+    },
     {
       name: 'fix',
       desc: 'Correct the last routing decision and pin that tier',
@@ -522,6 +545,174 @@ export const registerCommands = <
     );
   };
 
+  // `undefined` means "unknown" (no model to check, or the registry pick
+  // doesn't implement hasConfiguredAuth in this context): callers render
+  // that as no label at all rather than guessing.
+  const accountAuthLabel = (ctx: TCtx, aliasId: string): string => {
+    try {
+      const provider = ctx.modelRegistry.getProvider?.(aliasId);
+      const model = provider?.getModels()[0];
+      if (!model || !ctx.modelRegistry.hasConfiguredAuth) return '';
+      return ctx.modelRegistry.hasConfiguredAuth(model)
+        ? ''
+        : ' (not logged in)';
+    } catch {
+      return '';
+    }
+  };
+
+  const handleAccount = async (args: string[], ctx: TCtx) => {
+    const action = args[0];
+
+    if (action === 'add') {
+      const base = args[1];
+      if (!base || args.length > 2) {
+        ctx.ui.notify('Usage: /router account add <provider>', 'error');
+        return;
+      }
+      if (ACCOUNT_BASE_DENYLIST.has(base)) {
+        ctx.ui.notify(
+          `Extra accounts for "${base}" are not supported: Pi Black's Claude-subscription request transform only patches the built-in "anthropic" provider, and its implementation is private and unpublished, so this router cannot safely reuse it for "${base}-N" without depending on another extension's internals. See docs/ARCHITECTURE.md "Accounts".`,
+          'error',
+        );
+        return;
+      }
+      if (!pi.registerProvider) {
+        ctx.ui.notify(
+          'This Pi build does not support registering providers from an extension.',
+          'error',
+        );
+        return;
+      }
+      const baseProvider = ctx.modelRegistry.getProvider?.(base);
+      if (!baseProvider) {
+        ctx.ui.notify(
+          `Unknown provider "${base}". It must already be registered (built-in, via models.json, or by another extension) before you can add an extra account for it.`,
+          'error',
+        );
+        return;
+      }
+      if (!ACCOUNT_BASE_ALLOWLIST.has(base)) {
+        ctx.ui.notify(
+          `Extra accounts for "${base}" are not supported: this router only clones providers with a static model catalog and no credential-dependent refresh (currently: ${[...ACCOUNT_BASE_ALLOWLIST].join(', ')}). See docs/ARCHITECTURE.md "Accounts".`,
+          'error',
+        );
+        return;
+      }
+
+      // Claims the next free "<base>-<n>" slot by atomically O_EXCL-creating
+      // that id's own file -- no shared registry to read-modify-write, so a
+      // concurrent /router account add for the same base (another session,
+      // another process) always lands on a DIFFERENT number instead of racing
+      // onto the same one. See extensions/accounts.ts's module doc comment.
+      const claim = claimNextAccountSlot(base);
+      if (!claim.ok || !claim.aliasId || claim.accountNumber === undefined) {
+        ctx.ui.notify(
+          `Failed to register account for "${base}": ${claim.error}`,
+          'error',
+        );
+        return;
+      }
+      const { aliasId, accountNumber } = claim;
+
+      const registration = registerAccountProvider(
+        cloneProviderAsAccount(baseProvider, accountNumber),
+        ctx.modelRegistry,
+        pi,
+        state.ownedAccountProviderIds,
+      );
+      if (!registration.ok) {
+        // The slot file is already claimed and persisted (ok by design --
+        // claim-then-register, not register-then-persist, so there is never a
+        // window where a provider is registered but nothing on disk claims
+        // its slot). Tombstone it rather than deleting it: the number must
+        // never be reused even though registration never actually succeeded.
+        markAccountRemoved(aliasId);
+        ctx.ui.notify(
+          `Failed to register account "${aliasId}": ${registration.error}`,
+          'error',
+        );
+        return;
+      }
+
+      ctx.ui.notify(
+        `Registered account "${aliasId}" (clone of "${base}"). Run /login ${aliasId} to add its credential, then reference "${aliasId}/<model>" in a profile's model or fallbacks.`,
+        'info',
+      );
+      return;
+    }
+
+    if (action === 'list') {
+      if (args.length > 1) {
+        ctx.ui.notify('Usage: /router account list', 'error');
+        return;
+      }
+      // Fresh scan of the accounts directory on every call -- never a cached
+      // registry -- so this always reflects every process's adds/removes.
+      const registry = loadAccountRegistry();
+      const bases = Object.keys(registry.accounts).sort();
+      if (bases.length === 0) {
+        ctx.ui.notify('No extra accounts registered.', 'info');
+        return;
+      }
+      const lines = bases.map((base) => {
+        const aliases = listAliasesForBase(registry, base).map(
+          (alias) => `${alias}${accountAuthLabel(ctx, alias)}`,
+        );
+        return `${base}: ${aliases.join(', ')}`;
+      });
+      ctx.ui.notify(`Accounts:\n${lines.join('\n')}`, 'info');
+      return;
+    }
+
+    if (action === 'remove') {
+      const alias = args[1];
+      if (!alias || args.length > 2) {
+        ctx.ui.notify('Usage: /router account remove <base-n>', 'error');
+        return;
+      }
+      const parsed = parseAliasId(alias);
+      // Fresh read of just this alias's own file -- never a cached registry --
+      // so "does this account exist and is it active" always reflects every
+      // process's adds/removes, not just this session's view at startup.
+      const entry = parsed ? readAccountEntry(alias) : undefined;
+      if (!parsed || !entry || entry.removed) {
+        ctx.ui.notify(`No such account: ${alias}`, 'error');
+        return;
+      }
+
+      unregisterAccountProvider(alias, pi, state.ownedAccountProviderIds);
+
+      if (markAccountRemoved(alias)) {
+        ctx.ui.notify(`Removed account "${alias}".`, 'info');
+        return;
+      }
+
+      // Roll back: re-register the clone so the runtime registration matches
+      // what the (unchanged) on-disk file still says -- active -- rather than
+      // leaving the alias unregistered but still "active" on disk.
+      const baseProvider = ctx.modelRegistry.getProvider?.(parsed.base);
+      if (baseProvider) {
+        registerAccountProvider(
+          cloneProviderAsAccount(baseProvider, parsed.accountNumber),
+          ctx.modelRegistry,
+          pi,
+          state.ownedAccountProviderIds,
+        );
+      }
+      ctx.ui.notify(
+        `Failed to persist removal of "${alias}"; rolled back.`,
+        'error',
+      );
+      return;
+    }
+
+    ctx.ui.notify(
+      'Usage: /router account <add <provider>|list|remove <alias>>',
+      'error',
+    );
+  };
+
   pi.registerCommand('router', {
     description: 'Model router control center',
     getArgumentCompletions: (prefix) => {
@@ -608,6 +799,41 @@ export const registerCommands = <
             }));
           return items.length > 0 ? items : null;
         }
+        case 'account': {
+          const actionPrefix = subArgs[0] ?? '';
+          if (subArgs.length <= 1) {
+            const items = ['add', 'list', 'remove']
+              .filter((v) => v.startsWith(actionPrefix))
+              .map((v) => ({
+                value: `account ${v}`,
+                label: v,
+                description:
+                  v === 'add'
+                    ? 'Register an extra account for a provider'
+                    : v === 'list'
+                      ? 'List registered extra accounts'
+                      : 'Remove an extra account',
+              }));
+            return items.length > 0 ? items : null;
+          }
+          if (subArgs[0] === 'remove') {
+            const aliasPrefix = subArgs[1] ?? '';
+            // Fresh scan, same reasoning as handleAccount's 'list'/'remove'.
+            const registry = loadAccountRegistry();
+            const aliases = Object.keys(registry.accounts).flatMap((base) =>
+              listAliasesForBase(registry, base),
+            );
+            const items = aliases
+              .filter((alias) => alias.startsWith(aliasPrefix))
+              .map((alias) => ({
+                value: `account remove ${alias}`,
+                label: alias,
+                description: `Remove extra account "${alias}"`,
+              }));
+            return items.length > 0 ? items : null;
+          }
+          return null;
+        }
       }
 
       return null;
@@ -643,6 +869,9 @@ export const registerCommands = <
         case 'cooldown':
           await handleCooldowns(subArgs, ctx);
           break;
+        case 'account':
+          await handleAccount(subArgs, ctx);
+          break;
         case 'reload':
           await handleReload(subArgs, ctx);
           break;
@@ -666,6 +895,9 @@ export const registerCommands = <
               '  fix <tier>                  Correct the last routing decision and pin that tier for the current profile.',
               '  widget <on|off|toggle>      Control the persistent status widget visibility.',
               '  debug <on|off|show|clear>   Control routing debug logging to notifications and history.',
+              '  account add <provider>      Register an extra account (<provider>-N) cloned from an already-registered provider; run /login <provider>-N next.',
+              '  account list                List registered extra accounts.',
+              '  account remove <alias>      Remove an extra account.',
               '  reload                      Hot-reload the configuration JSON from .pi/model-router.json.',
               '  help, ?                     Show this help message.',
             ].join('\n'),

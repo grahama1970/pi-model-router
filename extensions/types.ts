@@ -62,6 +62,9 @@ export type RouterModelRegistry = Pick<
       | 'getAvailableOfType'
       | 'classify'
       | 'streamSimple'
+      // Used by the account-alias feature (extensions/accounts.ts) to clone
+      // a base provider's complete native registration under a new id.
+      | 'getProvider'
     >
   >;
 
@@ -87,7 +90,11 @@ export interface RouterCommandContext {
     setStatus: (key: string, text: string | undefined) => void;
     setWidget: (key: string, content: string[] | undefined) => void;
   };
-  modelRegistry: RouterModelLookup;
+  // RouterModelRegistry (not the narrower RouterModelLookup) so command
+  // handlers can reach the optional `getProvider` the account-alias feature
+  // (extensions/accounts.ts) needs; every other pick stays optional so
+  // existing fakes that only implement `find` still satisfy this type.
+  modelRegistry: RouterModelRegistry;
   model: Pick<Model<Api>, 'provider' | 'id'> | undefined;
 }
 
@@ -164,6 +171,7 @@ export interface RouterExtensionAPI<
   ) => void;
   unregisterVirtualModel?: (provider: string, id: string) => void;
   registerProvider?: ExtensionAPI['registerProvider'];
+  unregisterProvider?: ExtensionAPI['unregisterProvider'];
   registerCommand: (
     name: string,
     options: {
