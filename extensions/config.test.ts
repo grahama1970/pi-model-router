@@ -250,6 +250,29 @@ describe('config.ts', () => {
       expect(warnings[0]).toContain('missing a model');
     });
 
+    it('should normalize object fallbacks and ignore invalid thinking levels', () => {
+      const warnings: string[] = [];
+      const result = normalizeTierConfig(
+        {
+          model: 'gpt4',
+          fallbacks: [
+            { model: 'google/gemini-1.5-flash', thinking: 'low' },
+            { model: 'openai/gpt-4o-mini', thinking: 'invalid' },
+          ],
+        },
+        'p',
+        'high',
+        warnings,
+        models,
+      );
+      expect(result?.fallbacks).toEqual([
+        { model: 'google/gemini-1.5-flash', thinking: 'low' },
+        { model: 'openai/gpt-4o-mini' },
+      ]);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('invalid thinking level');
+    });
+
     it('should resolve and normalize details', () => {
       const warnings: string[] = [];
       const raw = {
@@ -263,7 +286,7 @@ describe('config.ts', () => {
       expect(result).toBeDefined();
       expect(result?.model).toBe('openai/gpt-4o');
       expect(result?.thinking).toBe('high');
-      expect(result?.fallbacks).toEqual(['google/gemini-1.5-flash']);
+      expect(result?.fallbacks).toEqual([{ model: 'google/gemini-1.5-flash' }]);
       expect(result?.resolvedContextWindow).toBe(50000);
       expect(result?.resolvedMaxTokens).toBe(2000);
       expect(warnings.length).toBe(1);

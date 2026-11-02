@@ -155,7 +155,7 @@ describe('ui.ts', () => {
       // Check Status
       expect(ctx.ui.setStatus).toHaveBeenCalledWith(
         'router',
-        '🚥 router:balanced [pin:high] -> high -> google/gemini-2.5-pro (xhigh)',
+        '🚥 router:balanced [pin:high] -> high -> google/gemini-2.5-pro (high)',
       );
 
       // Check Widget Lines
@@ -168,7 +168,7 @@ describe('ui.ts', () => {
       expect(widgetLines).toContain('[dim]Pin: high[/dim]');
       expect(widgetLines).toContain('[dim]Cost: $0.0050 / $10.00[/dim]');
       expect(widgetLines).toContain(
-        '[dim]Route: high -> google/gemini-2.5-pro (xhigh)[/dim]',
+        '[dim]Route: high -> google/gemini-2.5-pro (high)[/dim]',
       );
       expect(widgetLines).toContain('[dim]Phase: planning[/dim]');
     });

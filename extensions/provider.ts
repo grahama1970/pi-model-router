@@ -80,11 +80,19 @@ const supportsReasoning = (
   profile: RouterConfig['profiles'][string],
   modelRegistry: RouterModelCapabilityLookup | undefined,
 ): boolean =>
-  ROUTER_TIERS.some((tier) =>
-    modelRegistry
-      ? findModelByRef(profile[tier]?.model, modelRegistry)?.reasoning
-      : profile[tier] && profile[tier].reasoning !== false,
-  );
+  ROUTER_TIERS.some((tier) => {
+    const tierConfig = profile[tier];
+    if (!tierConfig) return false;
+    const modelRefs = [
+      tierConfig.model,
+      ...(tierConfig.fallbacks?.map((fallback) => fallback.model) ?? []),
+    ];
+    return modelRegistry
+      ? modelRefs.some(
+          (modelRef) => findModelByRef(modelRef, modelRegistry)?.reasoning,
+        )
+      : tierConfig.reasoning !== false;
+  });
 
 const getTierModels = (
   profile: RouterConfig['profiles'][string],
@@ -94,7 +102,10 @@ const getTierModels = (
   const tierConfig = profile[tier];
   if (!tierConfig) return preferredModel ? [preferredModel] : [];
   const base = [
-    ...new Set([tierConfig.model, ...(tierConfig.fallbacks ?? [])]),
+    ...new Set([
+      tierConfig.model,
+      ...(tierConfig.fallbacks?.map((fallback) => fallback.model) ?? []),
+    ]),
   ];
   if (!preferredModel) return base;
   const preferredIdx = base.indexOf(preferredModel);
@@ -249,14 +260,24 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
 
     const resolveDelegatedThinking = (
       tier: RouterTier,
-      baseThinking: ThinkingLevel,
+      targetRef: string,
       targetModel: Model<Api>,
     ): {
       effectiveThinking: ThinkingLevel;
       delegatedThinking: ThinkingLevel;
     } => {
+      const tierConfig = profile[tier];
+      const fallbackThinking =
+        targetRef === tierConfig?.model
+          ? undefined
+          : tierConfig?.fallbacks?.find(
+              (fallback) => fallback.model === targetRef,
+            )?.thinking;
       const effectiveThinking =
-        actions.getThinkingOverride(profileName, tier) ?? baseThinking;
+        actions.getThinkingOverride(profileName, tier) ??
+        fallbackThinking ??
+        tierConfig?.thinking ??
+        tier;
       const clamped = clampThinkingLevel(
         effectiveThinking,
         resolveThinkingLevels(tier, profile, registry, targetModel),
@@ -299,7 +320,7 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
       const resolved = resolveFirstAvailableModel(candidates);
       const { delegatedThinking } = resolveDelegatedThinking(
         directTier,
-        tierConfig.thinking ?? directTier,
+        resolved.modelRef,
         resolved.model,
       );
       return {
@@ -511,15 +532,15 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
       };
     }
 
-    const { effectiveThinking, delegatedThinking } = resolveDelegatedThinking(
+    const { delegatedThinking } = resolveDelegatedThinking(
       decision.tier,
-      decision.thinking,
+      resolved.modelRef,
       selectedModel,
     );
 
     decision = {
       ...decision,
-      thinking: effectiveThinking,
+      thinking: delegatedThinking,
     };
 
     state.lastDecision = decision;
@@ -527,7 +548,7 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
 
     const effectiveCtx = ctx ?? state.lastExtensionContext;
     try {
-      actions.syncPiThinkingLevel(effectiveThinking);
+      actions.syncPiThinkingLevel(delegatedThinking);
       if (effectiveCtx) {
         actions.updateStatus(effectiveCtx);
       }

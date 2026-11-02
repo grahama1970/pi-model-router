@@ -199,10 +199,15 @@ export interface ClassifierConfig {
   thinking?: ThinkingLevel;
 }
 
+export interface FallbackModel {
+  model: string;
+  thinking?: ThinkingLevel;
+}
+
 export interface RoutedTierConfig {
   model: string;
   thinking?: ThinkingLevel;
-  fallbacks?: string[];
+  fallbacks?: FallbackModel[];
   contextWindow?: number;
   maxTokens?: number;
   reasoning?: boolean;

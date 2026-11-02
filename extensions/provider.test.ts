@@ -113,7 +113,7 @@ describe('provider.ts (virtual models)', () => {
             model: 'openai/gpt-4o-mini',
             thinking: 'medium',
             resolvedContextWindow: 5000,
-            fallbacks: ['google/gemini-1.5-flash'],
+            fallbacks: [{ model: 'google/gemini-1.5-flash' }],
             resolvedThinkingLevels: ['low', 'medium', 'high'],
           },
         },
@@ -611,8 +611,8 @@ describe('provider.ts (virtual models)', () => {
 
     it('should rotate through multiple fallbacks in order on consecutive retries and preserve fallback across same-tier user turns', async () => {
       mockState.currentConfig.profiles.balanced.medium!.fallbacks = [
-        'google/gemini-1.5-flash',
-        'openai/gpt-4o-fallback-2',
+        { model: 'google/gemini-1.5-flash' },
+        { model: 'openai/gpt-4o-fallback-2' },
       ];
 
       registerRouterProvider(mockPi, mockState, mockActions);
@@ -699,6 +699,114 @@ describe('provider.ts (virtual models)', () => {
       );
       expect(retry2.model.provider).toBe('openai');
       expect(retry2.model.id).toBe('gpt-4o-fallback-2');
+    });
+
+    it('should use per-fallback thinking, tier thinking when omitted, and clamp to the selected model', async () => {
+      mockState.currentConfig.profiles.balanced.medium!.thinking = 'max';
+      mockState.currentConfig.profiles.balanced.medium!.resolvedThinkingLevels =
+        ['low', 'high'];
+      mockState.currentConfig.profiles.balanced.medium!.fallbacks = [
+        { model: 'google/gemini-1.5-flash', thinking: 'low' },
+        { model: 'openai/gpt-4o-fallback-2' },
+      ];
+
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      const initialRoute = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(initialRoute.thinkingLevel).toBe('high');
+
+      const retry1 = await vm.route(
+        buildRequest({
+          reason: 'retry',
+          state: initialRoute.state,
+          failed: {
+            model: createTestModel({ provider: 'openai', id: 'gpt-4o-mini' }),
+            thinkingLevel: 'high',
+            message: {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: '429 Too Many Requests',
+            },
+          },
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(retry1.model.id).toBe('gemini-1.5-flash');
+      expect(retry1.thinkingLevel).toBe('low');
+      expect(mockState.lastDecision?.thinking).toBe('low');
+
+      const retry2 = await vm.route(
+        buildRequest({
+          reason: 'retry',
+          state: retry1.state,
+          failed: {
+            model: createTestModel({
+              provider: 'google',
+              id: 'gemini-1.5-flash',
+            }),
+            thinkingLevel: 'low',
+            message: {
+              ...createAssistantMsg('', 0),
+              provider: 'google',
+              model: 'gemini-1.5-flash',
+              stopReason: 'error',
+              errorMessage: '503 Service Unavailable',
+            },
+          },
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(retry2.model.id).toBe('gpt-4o-fallback-2');
+      expect(retry2.thinkingLevel).toBe('high');
+      expect(mockState.lastDecision?.thinking).toBe('high');
+    });
+
+    it('should let the explicit thinking override win over a per-fallback level', async () => {
+      mockState.currentConfig.profiles.balanced.medium!.fallbacks = [
+        { model: 'google/gemini-1.5-flash', thinking: 'low' },
+      ];
+      mockActions.getThinkingOverride = vi.fn().mockReturnValue('max');
+
+      registerRouterProvider(mockPi, mockState, mockActions);
+      const vm = registeredVirtualModels.get('router/balanced')!;
+      const initialRoute = await vm.route(
+        buildRequest({
+          messages: [
+            { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+          ],
+        }),
+        mockState.lastExtensionContext!,
+      );
+      const retry = await vm.route(
+        buildRequest({
+          reason: 'retry',
+          state: initialRoute.state,
+          failed: {
+            model: createTestModel({ provider: 'openai', id: 'gpt-4o-mini' }),
+            thinkingLevel: 'medium',
+            message: {
+              ...createAssistantMsg('', 0),
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              stopReason: 'error',
+              errorMessage: '429 Too Many Requests',
+            },
+          },
+        }),
+        mockState.lastExtensionContext!,
+      );
+      expect(retry.model.id).toBe('gemini-1.5-flash');
+      expect(retry.thinkingLevel).toBe('high');
+      expect(mockState.lastDecision?.thinking).toBe('high');
     });
 
     it('should auto-pin on first turn when autoPinFirstTurnDecision is enabled and allow unpinning back to dynamic routing', async () => {

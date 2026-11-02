@@ -49,6 +49,10 @@ The extension is modularized for maintainability:
 - `extensions/state.ts`: Handles session-persisted state and snapshots.
 - `extensions/types.ts`: Centralized interface and type definitions.
 
+## Thinking Resolution
+
+For the model actually selected, thinking resolves in `extensions/provider.ts:261-288` (`resolveDelegatedThinking`): an explicit `/router thinking` override wins first, then the selected fallback's optional `thinking`, then the tier's `thinking` (the primary model always uses the tier value). The result is clamped against the selected model's capabilities with `clampThinkingLevel` in `extensions/config.ts:733-758` before dispatch and status/debug reporting.
+
 ## State & Persistence
 
 The router state is persisted using `pi.appendEntry` with a custom type `router-state`. This allows the router to:

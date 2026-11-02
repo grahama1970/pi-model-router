@@ -138,10 +138,17 @@
         "fallbacks": {
           "type": "array",
           "items": {
-            "type": "string",
-            "minLength": 1
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "$ref": "#/$defs/fallbackModel"
+              }
+            ]
           },
-          "description": "Ordered list of fallback models (\"provider/model\" or alias) if the primary model is unavailable or fails."
+          "description": "Ordered list of fallback models (\"provider/model\" or alias) if the primary model is unavailable or fails. Object entries can override thinking for that fallback."
         },
         "contextWindow": {
           "type": "integer",
@@ -159,6 +166,22 @@
           "items": {
             "$ref": "#/$defs/thinkingLevel"
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "fallbackModel": {
+      "type": "object",
+      "required": ["model"],
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Model reference (\"provider/model\" or an alias from \"models\")."
+        },
+        "thinking": {
+          "$ref": "#/$defs/thinkingLevel",
+          "description": "Thinking level used when this fallback is selected."
         }
       },
       "additionalProperties": false

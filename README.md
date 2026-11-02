@@ -64,6 +64,29 @@ Copy the example config to one of:
 }
 ```
 
+### Per-Fallback Thinking
+
+Fallback entries can be objects with an optional thinking level. String entries remain supported. For example, this chain uses `zai/glm-5.3` at `max`, then `anthropic/claude-opus-5-5` at `low`, then `openai-codex/gpt-6-astra` at `low`:
+
+```json
+{
+  "profiles": {
+    "orchestrator": {
+      "high": {
+        "model": "zai/glm-5.3",
+        "thinking": "max",
+        "fallbacks": [
+          { "model": "anthropic/claude-opus-5-5", "thinking": "low" },
+          { "model": "openai-codex/gpt-6-astra", "thinking": "low" }
+        ]
+      }
+    }
+  }
+}
+```
+
+An explicit `/router thinking` override takes precedence over a per-fallback level. Each requested level is clamped to the selected model's supported levels.
+
 ### Configuration Fields
 
 | Field                      | Description                                                                                                                                                                                                                                                              |

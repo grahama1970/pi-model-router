@@ -8,11 +8,8 @@ import type {
   RouterUIContext,
 } from './types';
 
-const getEffectiveThinking = (
-  thinkingByProfile: RouterThinkingByProfile,
-  profileName: string,
-  decision: RoutingDecision,
-) => thinkingByProfile[profileName]?.[decision.tier] ?? decision.thinking;
+const getEffectiveThinking = (decision: RoutingDecision): ThinkingLevel =>
+  decision.thinking;
 
 const getDecisionFlags = (decision: RoutingDecision): string[] => {
   const flags: string[] = [];
@@ -94,11 +91,7 @@ export const updateStatus = (
 
     let statusText: string;
     if (lastDecision && matchesProfile && matchesPin) {
-      const effectiveThinking = getEffectiveThinking(
-        thinkingByProfile,
-        activeRouterProfile,
-        lastDecision,
-      );
+      const effectiveThinking = getEffectiveThinking(lastDecision);
       statusText = `router:${activeRouterProfile}${pinLabel} -> ${lastDecision.tier} -> ${lastDecision.targetProvider}/${lastDecision.targetModelId} (${effectiveThinking})`;
     } else {
       statusText = `router:${activeRouterProfile}${pinLabel} -> waiting`;
@@ -120,11 +113,7 @@ export const updateStatus = (
     `Cost: ${formatSessionCost(accumulatedCost, currentConfig.maxSessionBudget)}`,
   ];
   if (lastDecision && lastDecision.profile === statusProfile) {
-    const effectiveThinking = getEffectiveThinking(
-      thinkingByProfile,
-      statusProfile,
-      lastDecision,
-    );
+    const effectiveThinking = getEffectiveThinking(lastDecision);
     const flags = getDecisionFlags(lastDecision);
     const flagsStr = flags.length > 0 ? ` [${flags.join(',')}]` : '';
 

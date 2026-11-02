@@ -16,6 +16,7 @@ import type {
   ModelDefinition,
   ClassifierConfig,
   RouterModelCapabilityLookup,
+  FallbackModel,
 } from './types';
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from './constants';
 
@@ -268,21 +269,48 @@ export const normalizeTierConfig = (
     );
   }
 
-  let fallbacks: string[] | undefined = undefined;
+  let fallbacks: FallbackModel[] | undefined = undefined;
   if (Array.isArray(value.fallbacks)) {
     fallbacks = [];
-    for (const f of value.fallbacks) {
-      if (typeof f === 'string') {
-        // Resolve aliases in fallbacks too
-        const resolvedFallback = resolveModelRef(f, models);
-        try {
-          parseCanonicalModelRef(resolvedFallback.canonicalRef);
-          fallbacks.push(resolvedFallback.canonicalRef);
-        } catch (error) {
+    for (const fallback of value.fallbacks) {
+      const fallbackModelRef =
+        typeof fallback === 'string'
+          ? fallback.trim()
+          : isObjectRecord(fallback) && typeof fallback.model === 'string'
+            ? fallback.model.trim()
+            : '';
+      if (!fallbackModelRef) {
+        warnings.push(
+          `Invalid fallback model in profile "${profileName}" ${tier} tier: expected a string or an object with a model field.`,
+        );
+        continue;
+      }
+
+      // Resolve aliases in fallbacks too.
+      const resolvedFallback = resolveModelRef(fallbackModelRef, models);
+      try {
+        parseCanonicalModelRef(resolvedFallback.canonicalRef);
+        const thinking =
+          isObjectRecord(fallback) && isThinkingLevel(fallback.thinking)
+            ? fallback.thinking
+            : undefined;
+        if (
+          isObjectRecord(fallback) &&
+          fallback.thinking !== undefined &&
+          !isThinkingLevel(fallback.thinking)
+        ) {
           warnings.push(
-            `Invalid fallback model "${f}" in profile "${profileName}" ${tier} tier: ${error instanceof Error ? error.message : String(error)}`,
+            `Fallback model "${fallbackModelRef}" in profile "${profileName}" ${tier} tier has invalid thinking level. Ignored.`,
           );
         }
+        fallbacks.push({
+          model: resolvedFallback.canonicalRef,
+          ...(thinking ? { thinking } : {}),
+        });
+      } catch (error) {
+        warnings.push(
+          `Invalid fallback model "${fallbackModelRef}" in profile "${profileName}" ${tier} tier: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
   }
@@ -537,6 +565,27 @@ const findTierModel = (
   modelRegistry?: RouterModelCapabilityLookup,
 ) => findModelByRef(tierConfig?.model, modelRegistry);
 
+const tierModelRefs = (tierConfig: RoutedTierConfig): string[] => [
+  tierConfig.model,
+  ...(tierConfig.fallbacks?.map((fallback) => fallback.model) ?? []),
+];
+
+const resolveThinkingLevelsForModel = (
+  tierConfig: RoutedTierConfig,
+  modelRef: string,
+  modelRegistry?: RouterModelCapabilityLookup,
+): ThinkingLevel[] | undefined => {
+  const registryModel = findModelByRef(modelRef, modelRegistry);
+  if (registryModel?.reasoning === false) return [];
+  if (registryModel?.thinkingLevelMap) {
+    return getSupportedThinkingLevels({
+      reasoning: true,
+      ...registryModel,
+    } as Model<Api>).filter((l) => l !== 'off');
+  }
+  return tierConfig.resolvedThinkingLevels;
+};
+
 /**
  * Resolve the effective context window for a specific tier at runtime,
  * incorporating the API model registry as the highest-priority source.
@@ -591,18 +640,19 @@ export const resolveThinkingLevels = (
   },
 ): ThinkingLevel[] | undefined => {
   const tierConfig = profile[tier];
-  const registryModel =
-    (targetModel?.thinkingLevelMap || targetModel?.reasoning === false
-      ? targetModel
-      : undefined) ?? findTierModel(tierConfig, modelRegistry);
-  if (registryModel?.reasoning === false) return [];
-  if (registryModel?.thinkingLevelMap) {
+  if (!tierConfig) return undefined;
+  if (targetModel?.thinkingLevelMap || targetModel?.reasoning === false) {
+    if (targetModel.reasoning === false) return [];
     return getSupportedThinkingLevels({
       reasoning: true,
-      ...registryModel,
+      ...targetModel,
     } as Model<Api>).filter((l) => l !== 'off');
   }
-  return tierConfig?.resolvedThinkingLevels;
+  return resolveThinkingLevelsForModel(
+    tierConfig,
+    tierConfig.model,
+    modelRegistry,
+  );
 };
 
 /**
@@ -614,9 +664,15 @@ export const collectProfileThinkingLevels = (
   modelRegistry?: RouterModelCapabilityLookup,
 ): Set<ThinkingLevel> =>
   new Set(
-    ROUTER_TIERS.flatMap(
-      (tier) => resolveThinkingLevels(tier, profile, modelRegistry) ?? [],
-    ),
+    ROUTER_TIERS.flatMap((tier) => {
+      const tierConfig = profile[tier];
+      if (!tierConfig) return [];
+      return tierModelRefs(tierConfig).flatMap(
+        (modelRef) =>
+          resolveThinkingLevelsForModel(tierConfig, modelRef, modelRegistry) ??
+          [],
+      );
+    }),
   );
 
 /**
@@ -631,20 +687,24 @@ export const getUnsupportedTiers = (
   ROUTER_TIERS.filter((tier) => {
     const tierConfig = profile[tier];
     if (!tierConfig) return false;
-    if (level === 'off') {
-      const registryModel = findTierModel(tierConfig, modelRegistry);
-      return (
-        registryModel?.reasoning !== false &&
-        registryModel?.thinkingLevelMap !== undefined &&
-        !getSupportedThinkingLevels({
-          reasoning: true,
-          ...registryModel,
-        } as Model<Api>).includes('off')
-      );
-    }
-    return !resolveThinkingLevels(tier, profile, modelRegistry)?.includes(
-      level,
-    );
+    return tierModelRefs(tierConfig).some((modelRef) => {
+      if (level === 'off') {
+        const registryModel = findModelByRef(modelRef, modelRegistry);
+        return (
+          registryModel?.reasoning !== false &&
+          registryModel?.thinkingLevelMap !== undefined &&
+          !getSupportedThinkingLevels({
+            reasoning: true,
+            ...registryModel,
+          } as Model<Api>).includes('off')
+        );
+      }
+      return !resolveThinkingLevelsForModel(
+        tierConfig,
+        modelRef,
+        modelRegistry,
+      )?.includes(level);
+    });
   });
 
 export const applyThinkingOverride = (
