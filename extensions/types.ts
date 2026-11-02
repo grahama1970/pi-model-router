@@ -121,6 +121,25 @@ export interface RouterThinkingLevelSelectEvent {
   level: ThinkingLevel;
 }
 
+// Mirrors Pi's real `CustomMessageEntryDraft` (a `SessionBoundaryDraft`
+// member): a session-persisted `role: "custom"` entry, tagged with
+// `customType`, never a literal `role: "user"` message. Narrowed to exactly
+// the fields extensions/autocontinue.ts produces.
+export interface RouterTurnEndEntryDraft {
+  type: 'custom_message';
+  customType: string;
+  content: string;
+  display: boolean;
+}
+
+// Mirrors Pi's real `BoundaryResult` (`TurnEndEventResult`): returning
+// `continue: true` from a `turn_end` handler requests exactly one more model
+// request for the same turn.
+export interface RouterTurnEndResult {
+  entries?: RouterTurnEndEntryDraft[];
+  continue?: boolean;
+}
+
 export interface VirtualRouterState {
   phase: RouterPhase;
   tier: RouterTier;
@@ -164,7 +183,44 @@ export interface RouterExtensionAPI<
   setThinkingLevel: ExtensionAPI['setThinkingLevel'];
   appendEntry: ExtensionAPI['appendEntry'];
   on(
-    event: 'session_start' | 'session_tree' | 'turn_start' | 'turn_end',
+    event: 'session_start' | 'session_tree' | 'turn_start',
+    handler: (event: unknown, ctx: TCtx) => Promise<void> | void,
+  ): void;
+  // turn_end is Pi's "actionable boundary" for the active turn. A handler's
+  // `{ entries, continue: true }` return is only honored here when Pi's own
+  // `finishTurn` decision was NOT already "end" -- which it always is for a
+  // non-retryable error, since Pi itself gave up on that turn. That makes
+  // turn_end unusable for auto-continue's actual use case; it is kept purely
+  // for non-continuation bookkeeping (cost accounting).
+  on(
+    event: 'turn_end',
+    handler: (
+      event: unknown,
+      ctx: TCtx,
+    ) => Promise<RouterTurnEndResult | void> | RouterTurnEndResult | void,
+  ): void;
+  // agent_before_settle fires once per run, right before the run loop would
+  // actually stop, independent of turn_end's (possibly discarded) decision.
+  // A handler's `{ entries, continue: true }` here is honored unconditionally
+  // (as long as the resulting context can still continue -- i.e. the last
+  // message is not itself an unanswered assistant message), which is why
+  // `extensions/autocontinue.ts` makes its actual continuation decision here,
+  // not in turn_end. Reuses `RouterTurnEndResult`'s shape: Pi's real
+  // `BoundaryResult` is identical for both boundaries.
+  on(
+    event: 'agent_before_settle',
+    handler: (
+      event: unknown,
+      ctx: TCtx,
+    ) => Promise<RouterTurnEndResult | void> | RouterTurnEndResult | void,
+  ): void;
+  // agent_settled fires exactly once per run, after the agent_before_settle
+  // loop above has fully stopped requesting continuations -- the only point
+  // at which extensions/autocontinue.ts's per-run "never chain" guard may
+  // safely reset for a later, genuinely independent run. Never fires more
+  // than once per run, unlike agent_before_settle.
+  on(
+    event: 'agent_settled',
     handler: (event: unknown, ctx: TCtx) => Promise<void> | void,
   ): void;
   on(

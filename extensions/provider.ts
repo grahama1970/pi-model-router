@@ -99,7 +99,11 @@ const supportsReasoning = (
       : tierConfig.reasoning !== false;
   });
 
-const getTierModels = (
+// Exported so the `agent_before_settle` auto-continue guard
+// (extensions/index.ts) can enumerate the same tier's configured model +
+// fallback refs it needs to check for a usable replacement, without a
+// second, drifting reimplementation of "this tier's candidate refs".
+export const getTierModels = (
   profile: RouterConfig['profiles'][string],
   tier: RouterTier,
   preferredModel?: string,
@@ -168,6 +172,13 @@ export interface RouterProviderState<TContext = ExtensionContext> {
   // process started, or one already processed this run, is never re-recorded.
   readonly processStartTime: number;
   readonly processedTranscriptFailures: Set<string>;
+  // Set by extensions/index.ts's turn_end handler for exactly one route()
+  // call, right after it decides to fire the one-shot auto-continue: names
+  // the model that just hit a non-retryable usage-limit error. route() below
+  // fires the single "continuing on <next>" notice once the replacement
+  // model is actually resolved (not in turn_end, which cannot know it yet),
+  // then always clears this so no later call can re-fire it.
+  pendingAutoContinueNotice?: { failedRef: string };
 }
 
 export interface RouterProviderActions<TContext = ExtensionContext> {
@@ -179,6 +190,13 @@ export interface RouterProviderActions<TContext = ExtensionContext> {
   ) => ThinkingLevel | undefined;
   updateStatus: (ctx: TContext) => void;
   syncPiThinkingLevel: (level: ThinkingLevel | undefined) => void;
+  // Optional so existing action mocks that don't exercise auto-continue need
+  // no change. Implementations must themselves be advisory (never throw).
+  notify?: (
+    ctx: TContext,
+    message: string,
+    type?: 'info' | 'warning' | 'error',
+  ) => void;
 }
 
 // Cooldowns are an advisory routing hint, never a correctness mechanism: a
@@ -211,6 +229,58 @@ const filterCooldownCandidates = (
   }
 };
 
+/**
+ * Resolves a canonical "provider/model" ref against a model registry: not
+ * the virtual `router` provider itself, present in the registry, and
+ * (when the registry reports it) authenticated. Exported so the
+ * `agent_before_settle` auto-continue guard (extensions/index.ts,
+ * extensions/autocontinue.ts) can ask "is there a usable replacement for the
+ * failed model?" with the exact same resolvability check `routeVirtualModelRequest`
+ * itself uses to pick a real model, instead of a second, drifting
+ * reimplementation of "resolvable + authenticated".
+ */
+export const resolveRoutedCandidate = (
+  modelRef: string,
+  registry: RouterModelRegistry,
+):
+  | {
+      ok: true;
+      model: Model<Api>;
+      provider: string;
+      modelId: string;
+    }
+  | {
+      ok: false;
+      error: string;
+    } => {
+  const { provider, modelId } = parseCanonicalModelRef(modelRef);
+  if (provider === 'router') {
+    return {
+      ok: false,
+      error: `Invalid routed target "${modelRef}": cannot route to virtual router provider.`,
+    };
+  }
+  const targetModel = registry.find(provider, modelId);
+  if (!targetModel) {
+    return {
+      ok: false,
+      error: `Routed model not found: ${provider}/${modelId}`,
+    };
+  }
+  if (registry.hasConfiguredAuth && !registry.hasConfiguredAuth(targetModel)) {
+    return {
+      ok: false,
+      error: `No configured credentials for routed model: ${provider}/${modelId}`,
+    };
+  }
+  return {
+    ok: true,
+    model: targetModel,
+    provider,
+    modelId,
+  };
+};
+
 export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
   request: ModelRouteRequest<VirtualRouterState>,
   ctx: TContext | undefined,
@@ -236,49 +306,8 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
       throw new Error(`Unknown router profile: ${profileName}`);
     }
 
-    const resolveCandidate = (
-      modelRef: string,
-    ):
-      | {
-          ok: true;
-          model: Model<Api>;
-          provider: string;
-          modelId: string;
-        }
-      | {
-          ok: false;
-          error: string;
-        } => {
-      const { provider, modelId } = parseCanonicalModelRef(modelRef);
-      if (provider === 'router') {
-        return {
-          ok: false,
-          error: `Invalid routed target "${modelRef}": cannot route to virtual router provider.`,
-        };
-      }
-      const targetModel = registry.find(provider, modelId);
-      if (!targetModel) {
-        return {
-          ok: false,
-          error: `Routed model not found: ${provider}/${modelId}`,
-        };
-      }
-      if (
-        registry.hasConfiguredAuth &&
-        !registry.hasConfiguredAuth(targetModel)
-      ) {
-        return {
-          ok: false,
-          error: `No configured credentials for routed model: ${provider}/${modelId}`,
-        };
-      }
-      return {
-        ok: true,
-        model: targetModel,
-        provider,
-        modelId,
-      };
-    };
+    const resolveCandidate = (modelRef: string) =>
+      resolveRoutedCandidate(modelRef, registry);
 
     // Cooldown filtering must only act on resolvable, authenticated candidates:
     // an unresolvable or unauthenticated model would fail resolution regardless
@@ -733,10 +762,31 @@ export const routeVirtualModelRequest = async <TContext = ExtensionContext>(
     actions.recordDebugDecision(decision);
 
     const effectiveCtx = ctx ?? state.lastExtensionContext;
+    // Consume the pending auto-continue notice before any other UI
+    // operation below: `syncPiThinkingLevel`/`updateStatus` can throw (stale
+    // extension context), and if the notice were cleared after them, that
+    // throw would leave it pending into a later, unrelated route() call,
+    // which would then fire a notice naming the wrong failed model. Clearing
+    // it here, unconditionally and first, guarantees it is used at most once
+    // no matter what happens next in this route() call.
+    const pendingAutoContinueNotice = state.pendingAutoContinueNotice;
+    state.pendingAutoContinueNotice = undefined;
     try {
       actions.syncPiThinkingLevel(delegatedThinking);
       if (effectiveCtx) {
         actions.updateStatus(effectiveCtx);
+      }
+      // Fire the one auto-continue notice agent_before_settle armed, now
+      // that the actual replacement model is known.
+      if (pendingAutoContinueNotice) {
+        const { failedRef } = pendingAutoContinueNotice;
+        if (effectiveCtx) {
+          actions.notify?.(
+            effectiveCtx,
+            `${failedRef} hit its usage limit; continuing on ${resolved.modelRef}`,
+            'info',
+          );
+        }
       }
     } catch {
       // Stale extension context — skip non-critical UI updates.

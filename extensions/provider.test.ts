@@ -163,6 +163,7 @@ describe('provider.ts (virtual models)', () => {
       getThinkingOverride: vi.fn().mockReturnValue(undefined),
       updateStatus: vi.fn(),
       syncPiThinkingLevel: vi.fn(),
+      notify: vi.fn(),
     };
   });
 
@@ -1559,6 +1560,142 @@ describe('provider.ts (virtual models)', () => {
 
         expect(retry.model).toBeDefined();
         errorSpy.mockRestore();
+      });
+    });
+
+    describe('auto-continue notice', () => {
+      // Mirrors what extensions/index.ts's turn_end handler does right
+      // before requesting the forced continuation: arm the pending notice
+      // and let the already-cooling model's cooldown be visible to route().
+      const armPendingNotice = (failedRef: string) => {
+        Object.assign(mockState, {
+          pendingAutoContinueNotice: { failedRef },
+        });
+      };
+
+      // Regression: without the notify wiring in provider.ts's route(), this
+      // stays unset and no notice is ever shown, even though the turn did
+      // continue on a different model.
+      it('fires exactly one notice naming the failed and replacement models once route() resolves the next model', async () => {
+        registerRouterProvider(mockPi, mockState, mockActions);
+        const vm = registeredVirtualModels.get('router/balanced')!;
+
+        mockState.cooldownStore!.record(
+          'openai/gpt-4o-mini',
+          'insufficient_quota',
+          'retry',
+          mockState.currentConfig,
+          Date.now(),
+        );
+        mockState.lastDecision = {
+          profile: 'balanced',
+          tier: 'medium',
+          phase: 'implementation',
+          targetProvider: 'openai',
+          targetModelId: 'gpt-4o-mini',
+          targetLabel: 'openai/gpt-4o-mini',
+          thinking: 'medium',
+          reasoning: 'Initial decision',
+          timestamp: Date.now(),
+        };
+        armPendingNotice('openai/gpt-4o-mini');
+
+        const route = await vm.route(
+          buildRequest({
+            reason: 'continuation',
+            messages: [
+              {
+                role: 'user',
+                content: 'fix this bug',
+                timestamp: Date.now(),
+              },
+            ],
+          }),
+          mockState.lastExtensionContext!,
+        );
+
+        expect(route.model.id).toBe('gemini-1.5-flash');
+        expect(mockActions.notify).toHaveBeenCalledTimes(1);
+        expect(mockActions.notify).toHaveBeenCalledWith(
+          mockState.lastExtensionContext,
+          'openai/gpt-4o-mini hit its usage limit; continuing on google/gemini-1.5-flash',
+          'info',
+        );
+        expect(mockState.pendingAutoContinueNotice).toBeUndefined();
+      });
+
+      // Regression: without clearing the flag after firing, a later,
+      // unrelated route() call in the same turn would re-fire the same
+      // notice ("silent on later turns" would be violated).
+      it('never fires again on a later route() call once the notice has been consumed', async () => {
+        registerRouterProvider(mockPi, mockState, mockActions);
+        const vm = registeredVirtualModels.get('router/balanced')!;
+
+        mockState.cooldownStore!.record(
+          'openai/gpt-4o-mini',
+          'insufficient_quota',
+          'retry',
+          mockState.currentConfig,
+          Date.now(),
+        );
+        mockState.lastDecision = {
+          profile: 'balanced',
+          tier: 'medium',
+          phase: 'implementation',
+          targetProvider: 'openai',
+          targetModelId: 'gpt-4o-mini',
+          targetLabel: 'openai/gpt-4o-mini',
+          thinking: 'medium',
+          reasoning: 'Initial decision',
+          timestamp: Date.now(),
+        };
+        armPendingNotice('openai/gpt-4o-mini');
+
+        await vm.route(
+          buildRequest({
+            reason: 'continuation',
+            messages: [
+              {
+                role: 'user',
+                content: 'fix this bug',
+                timestamp: Date.now(),
+              },
+            ],
+          }),
+          mockState.lastExtensionContext!,
+        );
+        expect(mockActions.notify).toHaveBeenCalledTimes(1);
+
+        await vm.route(
+          buildRequest({
+            messages: [
+              {
+                role: 'user',
+                content: 'another turn',
+                timestamp: Date.now(),
+              },
+            ],
+          }),
+          mockState.lastExtensionContext!,
+        );
+
+        expect(mockActions.notify).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not notify when no auto-continue is pending', async () => {
+        registerRouterProvider(mockPi, mockState, mockActions);
+        const vm = registeredVirtualModels.get('router/balanced')!;
+
+        await vm.route(
+          buildRequest({
+            messages: [
+              { role: 'user', content: 'fix this bug', timestamp: Date.now() },
+            ],
+          }),
+          mockState.lastExtensionContext!,
+        );
+
+        expect(mockActions.notify).not.toHaveBeenCalled();
       });
     });
   });

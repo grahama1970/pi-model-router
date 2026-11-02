@@ -1,4 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createCooldownStore } from './cooldown';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import type { Api, Model } from '@earendil-works/pi-ai';
 import type { ExtensionFactory } from '@earendil-works/pi-coding-agent';
@@ -7,6 +11,7 @@ import type {
   RouterExtensionAPI,
   RouterModelSelectEvent,
   RouterThinkingLevelSelectEvent,
+  RouterTurnEndResult,
 } from './types';
 import routerExtension from './index';
 
@@ -22,7 +27,12 @@ vi.mock('./config', async (importOriginal) => {
         profiles: {
           balanced: {
             high: { model: 'openai/gpt-4o' },
-            medium: { model: 'openai/gpt-4o-mini' },
+            // A fallback is present so the auto-continue tests below have a
+            // real usable replacement candidate to find in this tier.
+            medium: {
+              model: 'openai/gpt-4o-mini',
+              fallbacks: [{ model: 'openai/gpt-4o-mini-fallback' }],
+            },
           },
         },
       },
@@ -79,23 +89,36 @@ const buildMockCtx = () => ({
 
 type MockCtx = ReturnType<typeof buildMockCtx>;
 
+type RouterTestMessage = {
+  role?: string;
+  stopReason?: string;
+  errorMessage?: string;
+  provider?: string;
+  model?: string;
+  timestamp?: number;
+  usage?: { cost?: { total?: number } };
+};
+
 type FullRouterEvent = RouterModelSelectEvent &
   RouterThinkingLevelSelectEvent & {
-    message?: {
-      role?: string;
-      usage?: { cost?: { total?: number } };
-    };
+    outcome?: string;
+    message?: RouterTestMessage;
+    // Mirrors the real `AgentBeforeSettleEvent`'s `context.contextMessages`
+    // -- the shape `evaluateBeforeSettleForAutoContinue` actually reads.
+    context?: { contextMessages?: RouterTestMessage[] };
+    // Mirrors the real `AgentSettledEvent`'s `aborted` field.
+    aborted?: boolean;
   };
 
 type RegisteredHandler = (
   event: FullRouterEvent,
   ctx: MockCtx,
-) => Promise<void> | void;
+) => Promise<void | RouterTurnEndResult> | void | RouterTurnEndResult;
 
 type TriggerHandler = (
   event: Partial<FullRouterEvent>,
   ctx: MockCtx,
-) => Promise<void> | void;
+) => Promise<void | RouterTurnEndResult> | void | RouterTurnEndResult;
 
 const createMockPi = (eventListeners: Record<string, TriggerHandler[]>) => ({
   registerVirtualModel: vi.fn<
@@ -159,6 +182,10 @@ describe('index.ts (orchestrator)', () => {
       expect.any(Function),
     );
     expect(mockPi.on).toHaveBeenCalledWith('turn_end', expect.any(Function));
+    expect(mockPi.on).toHaveBeenCalledWith(
+      'agent_before_settle',
+      expect.any(Function),
+    );
   });
 
   it('should restore state from session on session_start hook', async () => {
@@ -619,6 +646,405 @@ describe('index.ts (orchestrator)', () => {
       // persistState is called, but snapshot deduplication may skip appendEntry
       // since state hasn't changed since session_start. The key assertion is
       // that setModel was NOT called (router is not enabled).
+    });
+  });
+
+  describe('agent_before_settle event: auto-continue', () => {
+    // record() now writes to disk the moment auto-continue fires (see
+    // extensions/index.ts), so every test in this block gets its own tmp
+    // cooldown dir via PI_MODEL_ROUTER_COOLDOWNS -- createCooldownStore()'s
+    // default dir (`defaultCooldownDir()`) is read lazily at
+    // routerExtension(mockPi) call time, so setting the env var before that
+    // call is enough; nothing in this file ever touches the real
+    // ~/.local/state/pi-model-router/cooldowns directory.
+    let cooldownDir: string;
+    let previousCooldownEnv: string | undefined;
+
+    beforeEach(() => {
+      previousCooldownEnv = process.env.PI_MODEL_ROUTER_COOLDOWNS;
+      cooldownDir = mkdtempSync(join(tmpdir(), 'pmr-index-cooldown-'));
+      process.env.PI_MODEL_ROUTER_COOLDOWNS = cooldownDir;
+    });
+
+    afterEach(() => {
+      if (previousCooldownEnv === undefined) {
+        delete process.env.PI_MODEL_ROUTER_COOLDOWNS;
+      } else {
+        process.env.PI_MODEL_ROUTER_COOLDOWNS = previousCooldownEnv;
+      }
+      rmSync(cooldownDir, { recursive: true, force: true });
+    });
+
+    const assistantLimitError = (overrides: Record<string, unknown> = {}) => ({
+      role: 'assistant',
+      stopReason: 'error',
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      errorMessage: 'insufficient_quota',
+      ...overrides,
+    });
+
+    const beforeSettleEvent = (
+      outcome: string,
+      message: RouterTestMessage,
+    ): Partial<FullRouterEvent> => ({
+      outcome,
+      context: { contextMessages: [message] },
+    });
+
+    const initRouterEnabled = async (mockCtx: MockCtx) => {
+      // buildMockCtx() defaults to model router/balanced, so session_start
+      // alone enables the router -- matching "a turn routed by router/*".
+      // Seeds a persisted `lastDecision` on the medium tier (the tier
+      // `assistantLimitError`'s failed model belongs to): the real
+      // `agent_before_settle` handler only knows which profile/tier to check
+      // for a usable replacement from `state.lastDecision`, which a real
+      // session always has by the time a routed turn can fail.
+      mockCtx.sessionManager.getBranch = () => [
+        {
+          type: 'custom',
+          customType: 'router-state',
+          data: {
+            enabled: true,
+            selectedProfile: 'balanced',
+            lastDecision: {
+              profile: 'balanced',
+              tier: 'medium',
+              phase: 'implementation',
+              targetProvider: 'openai',
+              targetModelId: 'gpt-4o-mini',
+              targetLabel: 'openai/gpt-4o-mini',
+              reasoning: 'test',
+              thinking: 'off',
+              timestamp: Date.now(),
+            },
+            timestamp: Date.now(),
+          },
+        },
+      ];
+      const sessionStartHandlers = eventListeners['session_start'] || [];
+      for (const handler of sessionStartHandlers) {
+        await handler({}, mockCtx);
+      }
+    };
+
+    // Regression: without the agent_before_settle wiring in index.ts, this
+    // returns undefined and the run simply ends with the error shown to the
+    // user -- no continuation, no notice. (A handler on turn_end alone
+    // cannot fix this: Pi's finishTurn discards turn_end's `continue`
+    // whenever its own retry/fallback decision was already "end", which it
+    // always is for a non-retryable error -- see
+    // extensions/autocontinue.ts's module doc comment.)
+    it('requests exactly one continuation with a custom_message entry on a non-retryable usage-limit error', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const handlers = eventListeners['agent_before_settle'] || [];
+      let result: unknown;
+      for (const handler of handlers) {
+        result = await handler(
+          beforeSettleEvent('error', assistantLimitError()),
+          mockCtx,
+        );
+      }
+
+      expect(result).toMatchObject({
+        continue: true,
+        entries: [
+          { type: 'custom_message', customType: 'router-auto-continue' },
+        ],
+      });
+    });
+
+    // The actual fix under test: the failed model's cooldown is written to
+    // disk at fire time, not left for route()'s own transcript scan on the
+    // continuation -- which would miss it entirely in a separate process
+    // that resumes this session later (see extensions/index.ts's
+    // agent_before_settle handler comment).
+    it('records a cooldown for the failed model on disk when it fires', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const handlers = eventListeners['agent_before_settle'] || [];
+      for (const handler of handlers) {
+        await handler(
+          beforeSettleEvent(
+            'error',
+            assistantLimitError({ timestamp: 1700000000000 }),
+          ),
+          mockCtx,
+        );
+      }
+
+      // A fresh store pointed at the same directory sees it as a foreign
+      // file, proving the write actually reached disk rather than staying
+      // only in this process's in-memory state.
+      const verifyStore = createCooldownStore(cooldownDir);
+      const entry = verifyStore.load(Date.now()).entries['openai/gpt-4o-mini'];
+      expect(entry).toBeDefined();
+      expect(entry?.source).toBe('transcript');
+      expect(entry?.recorded_at).toBe(new Date(1700000000000).toISOString());
+    });
+
+    it('never chains: a second consecutive error does not request another continuation', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const handlers = eventListeners['agent_before_settle'] || [];
+      let first: unknown;
+      let second: unknown;
+      for (const handler of handlers) {
+        first = await handler(
+          beforeSettleEvent('error', assistantLimitError()),
+          mockCtx,
+        );
+        second = await handler(
+          beforeSettleEvent(
+            'error',
+            assistantLimitError({
+              provider: 'google',
+              model: 'gemini-1.5-flash',
+            }),
+          ),
+          mockCtx,
+        );
+      }
+
+      expect(first).toMatchObject({ continue: true });
+      expect(second).toBeUndefined();
+    });
+
+    it("does not fire for a retryable 429, leaving it to Pi's own retry/fallback chain", async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const handlers = eventListeners['agent_before_settle'] || [];
+      let result: unknown;
+      for (const handler of handlers) {
+        result = await handler(
+          beforeSettleEvent(
+            'error',
+            assistantLimitError({ errorMessage: '429 too many requests' }),
+          ),
+          mockCtx,
+        );
+      }
+
+      expect(result).toBeUndefined();
+    });
+
+    it('never fires for a user abort', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const handlers = eventListeners['agent_before_settle'] || [];
+      let result: unknown;
+      for (const handler of handlers) {
+        result = await handler(
+          beforeSettleEvent(
+            'aborted',
+            assistantLimitError({ stopReason: 'aborted' }),
+          ),
+          mockCtx,
+        );
+      }
+
+      expect(result).toBeUndefined();
+    });
+
+    it('never fires when the turn was not routed by router/*', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      mockCtx.model = { provider: 'openai', id: 'gpt-4o' };
+
+      const sessionStartHandlers = eventListeners['session_start'] || [];
+      for (const handler of sessionStartHandlers) {
+        await handler({}, mockCtx);
+      }
+
+      const handlers = eventListeners['agent_before_settle'] || [];
+      let result: unknown;
+      for (const handler of handlers) {
+        result = await handler(
+          beforeSettleEvent('error', assistantLimitError()),
+          mockCtx,
+        );
+      }
+
+      expect(result).toBeUndefined();
+    });
+
+    // The regression this guards: resetting the chain guard on a non-error
+    // agent_before_settle (instead of agent_settled) would let a later
+    // failure in the SAME run re-fire; see extensions/autocontinue.ts's
+    // `resetAutoContinueGuardOnSettle` doc comment.
+    it('agent_settled resets the chain guard so a new run can auto-continue again', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const beforeSettleHandlers = eventListeners['agent_before_settle'] || [];
+      const settledHandlers = eventListeners['agent_settled'] || [];
+
+      let first: unknown;
+      for (const handler of beforeSettleHandlers) {
+        first = await handler(
+          beforeSettleEvent('error', assistantLimitError()),
+          mockCtx,
+        );
+      }
+      expect(first).toMatchObject({ continue: true });
+
+      // The continuation succeeds, but Pi's run loop can still dispatch
+      // agent_before_settle again within the same run.
+      let midRun: unknown;
+      for (const handler of beforeSettleHandlers) {
+        midRun = await handler(
+          beforeSettleEvent(
+            'completed',
+            assistantLimitError({ stopReason: 'stop' }),
+          ),
+          mockCtx,
+        );
+      }
+      expect(midRun).toBeUndefined();
+
+      // A later turn in the SAME run fails on a different model: still
+      // chained, no second fire.
+      let sameRunSecond: unknown;
+      for (const handler of beforeSettleHandlers) {
+        sameRunSecond = await handler(
+          beforeSettleEvent(
+            'error',
+            assistantLimitError({
+              provider: 'google',
+              model: 'gemini-1.5-flash',
+            }),
+          ),
+          mockCtx,
+        );
+      }
+      expect(sameRunSecond).toBeUndefined();
+
+      // The run actually settles.
+      for (const handler of settledHandlers) {
+        await handler({ aborted: false }, mockCtx);
+      }
+
+      // A later, independent run's failure gets its own fresh budget.
+      let newRun: unknown;
+      for (const handler of beforeSettleHandlers) {
+        newRun = await handler(
+          beforeSettleEvent(
+            'error',
+            assistantLimitError({
+              provider: 'google',
+              model: 'gemini-1.5-flash',
+            }),
+          ),
+          mockCtx,
+        );
+      }
+      expect(newRun).toMatchObject({ continue: true });
+    });
+
+    // The regression this guards: without a usable replacement check, this
+    // would fire and re-request the SAME sole model for the 'high' tier
+    // (single model, no fallback), hitting the identical limit error again.
+    it('does not fire when the failed model has no usable replacement in its tier', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      mockCtx.sessionManager.getBranch = () => [
+        {
+          type: 'custom',
+          customType: 'router-state',
+          data: {
+            enabled: true,
+            selectedProfile: 'balanced',
+            lastDecision: {
+              profile: 'balanced',
+              tier: 'high',
+              phase: 'implementation',
+              targetProvider: 'openai',
+              targetModelId: 'gpt-4o',
+              targetLabel: 'openai/gpt-4o',
+              reasoning: 'test',
+              thinking: 'off',
+              timestamp: Date.now(),
+            },
+            timestamp: Date.now(),
+          },
+        },
+      ];
+      const sessionStartHandlers = eventListeners['session_start'] || [];
+      for (const handler of sessionStartHandlers) {
+        await handler({}, mockCtx);
+      }
+
+      const handlers = eventListeners['agent_before_settle'] || [];
+      let result: unknown;
+      for (const handler of handlers) {
+        result = await handler(
+          beforeSettleEvent(
+            'error',
+            assistantLimitError({ provider: 'openai', model: 'gpt-4o' }),
+          ),
+          mockCtx,
+        );
+      }
+
+      expect(result).toBeUndefined();
+    });
+
+    // The regression this guards: `updateStatus`/`syncPiThinkingLevel`
+    // throwing in route() (stale extension context) used to leave the
+    // pending notice unconsumed into a later, unrelated route() call, which
+    // would then fire a notice naming the wrong failed model. agent_settled
+    // now drops any notice route() never got to consume at all -- e.g. the
+    // continuation itself is cancelled before its own route() call runs.
+    it('agent_settled clears a pending auto-continue notice route() never consumed', async () => {
+      routerExtension(mockPi);
+      const mockCtx = buildMockCtx();
+      await initRouterEnabled(mockCtx);
+
+      const beforeSettleHandlers = eventListeners['agent_before_settle'] || [];
+      const settledHandlers = eventListeners['agent_settled'] || [];
+
+      for (const handler of beforeSettleHandlers) {
+        await handler(
+          beforeSettleEvent('error', assistantLimitError()),
+          mockCtx,
+        );
+      }
+
+      // The continuation never reaches route() (e.g. cancelled) -- the run
+      // settles with the pending notice still unconsumed.
+      for (const handler of settledHandlers) {
+        await handler({ aborted: true }, mockCtx);
+      }
+
+      const vmDef = mockPi.registerVirtualModel.mock.lastCall?.[0];
+      expect(vmDef).toBeDefined();
+      (mockCtx.ui.notify as ReturnType<typeof vi.fn>).mockClear();
+
+      // A later, unrelated route() call must never fire a stale notice naming
+      // the wrong failed model.
+      await vmDef!.route(
+        {
+          model: { id: 'balanced', provider: 'router' } as Model<Api>,
+          thinkingLevel: 'high',
+          reason: 'user',
+          messages: [{ role: 'user', content: 'hello', timestamp: 0 }],
+        },
+        mockCtx,
+      );
+
+      expect(mockCtx.ui.notify).not.toHaveBeenCalled();
     });
   });
 
