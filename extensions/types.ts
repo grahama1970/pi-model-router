@@ -111,6 +111,10 @@ export interface RouterExtensionContext extends RouterUIContext {
     | undefined;
   sessionManager: {
     getBranch: () => readonly CustomSessionEntry[];
+    // Pi 1.4.0 `SessionManager.getEntries(): SessionEntry[]` -- every entry in
+    // the session, not just the active branch -- narrowed to the fields this
+    // extension reads.
+    getEntries: () => readonly CustomSessionEntry[];
   };
   ui: RouterUIContext['ui'] & RouterCommandContext['ui'];
 }

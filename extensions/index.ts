@@ -386,6 +386,15 @@ const routerExtension = <
     actions.reregisterAccounts(ctx);
     actions.refreshEncryptedRejections(ctx);
 
+    // Pi only applies the model passed to `createAgentSession()` when the
+    // session has no history, and a caller such as pi-subagents makes that
+    // choice explicitly for a child session. A non-router model here is that
+    // explicit choice, so saved router-state may restore the profile and pins
+    // but must never re-enable the router or call setModel: doing so silently
+    // replaces the requested model and fails the caller's model check.
+    const hasExplicitPhysicalModel =
+      ctx.model !== undefined && ctx.model.provider !== 'router';
+
     state.routerEnabled = ctx.model?.provider === 'router';
     state.selectedProfile =
       ctx.model?.provider === 'router'
@@ -427,7 +436,7 @@ const routerExtension = <
         state.currentConfig,
         savedState.selectedProfile,
       );
-      state.routerEnabled = savedState.enabled;
+      state.routerEnabled = savedState.enabled && !hasExplicitPhysicalModel;
       if (savedState.pinByProfile) {
         Object.assign(state.pinnedTierByProfile, savedState.pinByProfile);
       }

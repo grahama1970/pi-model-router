@@ -381,6 +381,18 @@ The router state is persisted using `pi.appendEntry` with a custom type `router-
 - Maintain independent pins and state for different conversation branches.
 - Track accumulated session costs safely.
 
+### Restoring `router-state` around an explicit model
+
+Pi uses the model passed to `createAgentSession()` only when the session has no history; a resumed session otherwise re-derives its model from the branch (`pi-coding-agent` `dist/core/sdk.js`). Callers that resume a session with an explicit model therefore reach `session_start` with `ctx.model` already set to that physical model — pi-subagents passes the child's model this way.
+
+`restoreStateFromSession` (`extensions/index.ts`) treats a non-`router` `ctx.model` as that explicit choice:
+
+- the saved `router-state` still loads the profile, `pinByProfile`, `thinkingByProfile`, debug/widget flags and cost fields, so an explicit `/model router/<profile>` later in the same session needs no second restore;
+- but `savedState.enabled` cannot switch the router on, and the restore never calls `pi.setModel`, so the requested model stays selected (regression test: `extensions/index.test.ts`, "should keep an explicit physical model instead of restoring the saved router profile");
+- when `ctx.model` is `router/<profile>`, behavior is unchanged: the saved state enables the router and keeps the saved profile active.
+
+Verified with Pi's real `SessionManager` over a synthetic session file whose branch holds `router-state { enabled: true, selectedProfile: "orchestrator" }` plus a `model_change` to `deepseek/deepseek-flash`: the unpatched restore switched the session to `router/orchestrator`, the patched one keeps `deepseek/deepseek-flash` and persists `enabled: false` with `selectedProfile: "orchestrator"` retained. A session whose current model is `router/orchestrator` still restores the router in both.
+
 ## Reliability: Fallback Chains
 
 Each tier in a profile can define an optional `fallbacks` list. If the primary model fails (e.g., due to rate limits or provider downtime), the router automatically retries the next model in the chain before surfacing an error to the user.

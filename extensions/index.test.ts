@@ -190,11 +190,16 @@ describe('index.ts (orchestrator)', () => {
     );
   });
 
-  it('should restore state from session on session_start hook', async () => {
+  // Regression: pi-subagents passes the child's model to
+  // `createAgentSession()`, and Pi honors it precisely because a resumed
+  // child conversation has no history. A branch whose router-state says
+  // `enabled: true` used to override that choice with router/<profile>, which
+  // the caller then reported as model_verification_failed.
+  it('should keep an explicit physical model instead of restoring the saved router profile', async () => {
     routerExtension(mockPi);
 
     const mockCtx = buildMockCtx();
-    mockCtx.model = { provider: 'openai', id: 'gpt-4o' };
+    mockCtx.model = { provider: 'deepseek', id: 'deepseek-flash' };
     mockCtx.sessionManager.getBranch = () => [
       {
         type: 'custom',
@@ -212,15 +217,77 @@ describe('index.ts (orchestrator)', () => {
       },
     ];
 
-    // Trigger session_start
     const sessionStartHandlers = eventListeners['session_start'] || [];
     for (const handler of sessionStartHandlers) {
       await handler({}, mockCtx);
     }
 
+    // The physical model stays selected: no router/* switch, and none of the
+    // restore-failure notifications that only apply to a router restore.
+    expect(mockPi.setModel).not.toHaveBeenCalled();
+    expect(
+      mockCtx.ui.notify.mock.calls.filter(
+        ([, type]) => type === 'warning' || type === 'error',
+      ),
+    ).toEqual([]);
     expect(mockCtx.ui.setStatus).toHaveBeenCalled();
-    expect(mockPi.setModel).toHaveBeenCalledWith(
-      expect.objectContaining({ provider: 'router', id: 'balanced' }),
+
+    // The rest of the saved state still loads, so an explicit switch back to
+    // router/* needs no second restore.
+    expect(mockPi.appendEntry).toHaveBeenLastCalledWith(
+      'router-state',
+      expect.objectContaining({
+        enabled: false,
+        selectedProfile: 'balanced',
+        pinByProfile: { balanced: 'high' },
+        debugEnabled: true,
+        widgetEnabled: true,
+        accumulatedCost: 0.012,
+      }),
+    );
+
+    mockPi.appendEntry.mockClear();
+    for (const handler of eventListeners['model_select'] || []) {
+      await handler({ model: { provider: 'router', id: 'balanced' } }, mockCtx);
+    }
+
+    expect(mockPi.appendEntry).toHaveBeenLastCalledWith(
+      'router-state',
+      expect.objectContaining({ enabled: true, selectedProfile: 'balanced' }),
+    );
+  });
+
+  it('should restore the saved router profile when the session model is router/*', async () => {
+    routerExtension(mockPi);
+
+    // buildMockCtx() defaults to ctx.model router/balanced.
+    const mockCtx = buildMockCtx();
+    mockCtx.sessionManager.getBranch = () => [
+      {
+        type: 'custom',
+        customType: 'router-state',
+        data: {
+          enabled: true,
+          selectedProfile: 'balanced',
+          pinByProfile: { balanced: 'high' },
+          thinkingByProfile: {},
+          timestamp: Date.now(),
+        },
+      },
+    ];
+
+    const sessionStartHandlers = eventListeners['session_start'] || [];
+    for (const handler of sessionStartHandlers) {
+      await handler({}, mockCtx);
+    }
+
+    expect(mockPi.appendEntry).toHaveBeenLastCalledWith(
+      'router-state',
+      expect.objectContaining({
+        enabled: true,
+        selectedProfile: 'balanced',
+        pinByProfile: { balanced: 'high' },
+      }),
     );
   });
 
@@ -505,7 +572,16 @@ describe('index.ts (orchestrator)', () => {
       routerExtension(mockPi);
 
       const mockCtx = buildMockCtx();
-      mockCtx.model = { provider: 'openai', id: 'gpt-4o' };
+      // Pi already holds router/balanced, so the saved profile resolves to a
+      // DIFFERENT registry definition (a renamed/replaced profile model) --
+      // the only way `setModelInternally` reaches the real `pi.setModel` call
+      // now that a physical ctx.model skips the restore entirely.
+      mockCtx.model = { provider: 'router', id: 'balanced' };
+      mockCtx.modelRegistry.find = vi
+        .fn()
+        .mockReturnValue(
+          createTestModel({ provider: 'router', id: 'balanced-beta' }),
+        );
       mockCtx.sessionManager.getBranch = () => [
         {
           type: 'custom',
